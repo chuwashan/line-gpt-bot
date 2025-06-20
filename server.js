@@ -1,66 +1,106 @@
+// server.js
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-require('dotenv').config();
-
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+// 環境変数
+const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const GPT_API_KEY = process.env.OPENAI_API_KEY;
+
 app.use(bodyParser.json());
 
-const CHANNEL_ACCESS_TOKEN = process.env.CHANNEL_ACCESS_TOKEN;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
+// ユーザーメッセージの処理エンドポイント
 app.post('/webhook', async (req, res) => {
   const events = req.body.events;
+  if (!Array.isArray(events)) return res.sendStatus(200);
 
   for (const event of events) {
     if (event.type === 'message' && event.message.type === 'text') {
       const userMessage = event.message.text;
       const replyToken = event.replyToken;
 
-      try {
-        const gptRes = await axios.post(
-          'https://api.openai.com/v1/chat/completions',
-          {
-            model: 'gpt-4o',
-            messages: [{ role: 'user', content: userMessage }]
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${OPENAI_API_KEY}`,
-              'Content-Type': 'application/json'
-            }
-          }
-        );
+      const userData = extractUserData(userMessage);
 
-        const replyText = gptRes.data.choices[0].message.content;
-
-        await axios.post(
-          'https://api.line.me/v2/bot/message/reply',
-          {
-            replyToken,
-            messages: [{ type: 'text', text: replyText }]
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${CHANNEL_ACCESS_TOKEN}`,
-              'Content-Type': 'application/json'
-            }
-          }
-        );
-      } catch (err) {
-        console.error('Error:', err.response?.data || err.message);
+      // 必須項目チェック（①②⑥）
+      if (userData.name && userData.birthdate && userData.concern) {
+        const prompt = generatePrompt(userData);
+        const gptResult = await callGPT(prompt);
+        await replyText(replyToken, gptResult);
+      } else {
+        await replyText(replyToken, '📝 自己分析を行うために、①お名前、②生年月日、⑥相談内容をご記入ください。');
       }
     }
   }
-
   res.sendStatus(200);
 });
 
-app.get('/', (req, res) => {
-  res.send('LINE GPT Bot is running!');
-});
+function extractUserData(text) {
+  const fields = {};
+  const regexMap = {
+    name: /①[:：]?\s*(.*?)(?=\n|②|$)/,
+    birthdate: /②[:：]?\s*(.*?)(?=\n|③|$)/,
+    time: /③[:：]?\s*(.*?)(?=\n|④|$)/,
+    mbti: /④[:：]?\s*(.*?)(?=\n|⑤|$)/,
+    animal: /⑤[:：]?\s*(.*?)(?=\n|⑥|$)/,
+    concern: /⑥[:：]?\s*(.*)/
+  };
 
-const PORT = process.env.PORT || 3000;
+  for (const [key, regex] of Object.entries(regexMap)) {
+    const match = text.match(regex);
+    fields[key] = match ? match[1].trim() : null;
+  }
+
+  return fields;
+}
+
+function generatePrompt(data) {
+  return `以下の情報をもとに、プロの占い師が監修した自己分析を実施してください。\n
+名前：${data.name}\n
+生年月日：${data.birthdate}\n
+生まれた時間：${data.time || '不明'}\n
+MBTI：${data.mbti || '不明'}\n
+動物占い：${data.animal || '不明'}\n
+相談内容：${data.concern}\n
+\n全体で1000文字以内におさめ、やさしい語り口で診断してください。`;
+}
+
+async function callGPT(prompt) {
+  try {
+    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.8
+    }, {
+      headers: {
+        'Authorization': `Bearer ${GPT_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    return response.data.choices[0].message.content.trim();
+  } catch (err) {
+    console.error('GPT呼び出しエラー:', err.message);
+    return '診断中にエラーが発生しました。時間をおいて再試行してください。';
+  }
+}
+
+async function replyText(replyToken, text) {
+  try {
+    await axios.post('https://api.line.me/v2/bot/message/reply', {
+      replyToken,
+      messages: [{ type: 'text', text }]
+    }, {
+      headers: {
+        'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json'
+      }
+    });
+  } catch (err) {
+    console.error('LINE返信エラー:', err.message);
+  }
+}
+
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
 });
