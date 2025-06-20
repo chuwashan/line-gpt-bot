@@ -1,204 +1,135 @@
+/*
+ * server.js — LINE × Supabase × GPT  (未来予報士アイ 2025-06-21 軽量版)
+ * ------------------------------------------------------------
+ * Stripe 依存を完全排除し、コードを「LINE の流れ」に沿って整理。
+ * 1. ユーザー情報入力（①〜④）
+ * 2. 自己分析レポート送信  → extra_credits を 1 消費
+ * 3. ユーザーが「特別プレゼント」を送信
+ * 4. タロット結果＋フォローアップ送信 → extra_credits を 0、session_closed=true
+ * ------------------------------------------------------------
+ */
+
+// ❶ 依存モジュール & 環境変数
 const express = require('express');
+const bodyParser = require('body-parser');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
-const bodyParser = require('body-parser');
-const stripeSDK = require('stripe');
+require('dotenv').config();
 
-// ─────────────────────────────────────────
-// 環境変数
-// ─────────────────────────────────────────
-const CHANNEL_ACCESS_TOKEN   = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const GPT_API_KEY            = process.env.OPENAI_API_KEY;
-const SUPABASE_URL           = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE  = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const STRIPE_SECRET_KEY      = process.env.STRIPE_SECRET_KEY;      // 追加
-const STRIPE_WEBHOOK_SECRET  = process.env.STRIPE_WEBHOOK_SECRET;
+const PORT   = process.env.PORT || 3000;
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const GPT_API_KEY  = process.env.OPENAI_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// ─────────────────────────────────────────
-// 初期化
-// ─────────────────────────────────────────
-const app       = express();
-const PORT      = process.env.PORT || 3000;
-const supabase  = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
-const stripe    = stripeSDK(STRIPE_SECRET_KEY);
+// ❷ Supabase クライアント
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
-// ─────────────────────────────────────────
-// 1) Stripe Webhook  ― 先に raw で受け取る
-// ─────────────────────────────────────────
-app.post(
-  '/webhook/stripe',
-  express.raw({ type: 'application/json' }),      // 生の Buffer を保持
-  async (req, res) => {
-    const sig = req.headers['stripe-signature'];
-
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error('[Stripe] Signature verify failed:', err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    // ── checkout.session.completed ──────────────────────────
-    if (event.type === 'checkout.session.completed') {
-      const session = event.data.object;
-      const userId  = session.client_reference_id;   // 決済リンクで埋め込んだ ID
-
-      if (userId) {
-        const { error } = await supabase
-          .from('users')
-          .upsert({ id: userId, extra_credits: 5 }, { onConflict: 'id' });
-
-        if (error) console.error('[Supabase] upsert error:', error);
-        else       console.log(`[Stripe] credits +5 for user ${userId}`);
-      }
-    }
-
-    res.status(200).send('OK');
-  }
-);
-
-// ─────────────────────────────────────────
-// 2) ここから通常 API は JSON で受取
-// ─────────────────────────────────────────
+// ❸ Express 初期化
+const app = express();
 app.use(bodyParser.json());
 
-// LINE webhook
+// ❹ フォローアップ固定文（タロット後 + クロージング）
+const FOLLOWUP_MSG = `🕊️ ご感想を聞かせてください 🕊️\n\nカードを通してお伝えしたメッセージが、\n少しでも心のやわらぎにつながっていれば幸いです。\n\n・いちばん響いたフレーズ\n・気づいたこと など\nふと思い浮かんだことがあれば一言お送りくださいね。\n\n─────────\n【次のご案内】\n今回の無料特典はここまでとなりますが、\nもっと深く寄り添うサポートをご希望の方へ\nココナラ専用プランをご用意しています。\n\n▶︎ https://coconala.com/invite/CR0VNB\n(登録で1,000ptプレゼント／初回500円占いが実質無料)\n\n無理のない範囲でご検討ください。\nいつでもお待ちしています🌙\n─────────\n\n※占いが役に立ったと思っていただけたら、\nThreadsでリポストやコメントをいただけると励みになります🌸`;
+
+// ❺ LINE Webhook エンドポイント
 app.post('/webhook', async (req, res) => {
   const events = req.body.events || [];
-  for (const evt of events) {
-    if (evt.type !== 'message' || evt.message.type !== 'text') continue;
+  for (const ev of events) {
+    if (ev.type !== 'message' || ev.message.type !== 'text') continue;
 
-    const userId      = evt.source.userId;
-    const replyToken  = evt.replyToken;
-    const userMessage = evt.message.text;
+    const userId = ev.source.userId;
+    const replyToken = ev.replyToken;
+    const text = ev.message.text.trim();
 
-    // ユーザーデータ
-    const userData = extractUserData(userMessage);
-
-    // ユーザーレコード取得 / 作成
-    const { data: userRow, error } =
-      await supabase.from('users').select('*').eq('id', userId).single();
-
-    let credits = 0;
-    if (error && error.code === 'PGRST116') {
-      // 新規ユーザーは credits=0 で作成
-      await supabase.from('users').insert({ id: userId, extra_credits: 0 });
-    } else if (!error) {
-      credits = userRow.extra_credits;
+    // ------------ DB からユーザー取得 or 作成 ------------
+    let { data: user } = await supabase.from('users').select('*').eq('id', userId).single();
+    if (!user) {
+      await supabase.from('users').insert({ id: userId, extra_credits: 2, session_closed: false });
+      user = { id: userId, extra_credits: 2, session_closed: false };
     }
 
-    // クレジットが無ければストップ
-    if (credits <= 0) {
-      await replyText(
-        replyToken,
-        '⚠️ 無料診断は1回限りです。\nサブスク登録すると追加診断がご利用いただけます。'
-      );
+    // ------------ セッション終了ユーザーは応答しない ------------
+    if (user.session_closed) {
+      res.sendStatus(200);
       continue;
     }
 
-    // 必須項目が揃っていなければリマインド
-    if (!(userData.name && userData.birthdate && userData.concern)) {
-      await replyText(
-        replyToken,
-        '📝 自己分析を行うために、①お名前、②生年月日、⑥相談内容をご記入ください。'
-      );
+    // ------------ 「特別プレゼント」トリガー ------------
+    if (text === '特別プレゼント' && user.extra_credits === 1) {
+      // タロット用プロンプトを生成（詳細割愛）
+      const tarotPrompt = `あなたは未来予報士アイです。ユーザーの相談: ${user.concern || '相談内容なし'} を3枚タロットで…`;
+      const tarotAns = await callGPT(tarotPrompt);
+
+      await replyText(replyToken, `${tarotAns}\n\n${FOLLOWUP_MSG}`);
+      await supabase.from('users').update({ extra_credits: 0, session_closed: true }).eq('id', userId);
       continue;
     }
 
-    // GPT へ
-    const prompt = generatePrompt(userData);
-    const gptRes = await callGPT(prompt);
-    await replyText(replyToken, gptRes);
-
-    // ログ保存 ＆ クレジット減算
-    await supabase.from('diagnosis_logs').insert({
-      user_id: userId,
-      ...userData,
-      diagnosis_result: gptRes,
-    });
-    await supabase
-      .from('users')
-      .update({ extra_credits: credits - 1 })
-      .eq('id', userId);
+    // ------------ 自己分析フロー ------------
+    const data = extractUserData(text);
+    if (data.name && data.birthdate && user.extra_credits === 2) {
+      const prompt = generateSelfPrompt(data);
+      const report = await callGPT(prompt);
+      await replyText(replyToken, report);
+      await supabase.from('users').update({ ...data, extra_credits: 1 }).eq('id', userId);
+    } else if (user.extra_credits === 2) {
+      await replyText(replyToken, 'まずは①お名前②生年月日③出生時間④MBTI の情報をコピペでお送りください。');
+    }
   }
   res.sendStatus(200);
 });
 
-// ─────────────────────────────────────────
-// util
-// ─────────────────────────────────────────
+// ❻ ヘルパー関数
 function extractUserData(text) {
-  const map = {
-    name: /①[:：]?\s*(.*?)(?=\n|②|$)/s,
-    birthdate: /②[:：]?\s*(.*?)(?=\n|③|$)/s,
-    birthtime: /③[:：]?\s*(.*?)(?=\n|④|$)/s,
-    mbti: /④[:：]?\s*(.*?)(?=\n|⑤|$)/s,
-    animal_type: /⑤[:：]?\s*(.*?)(?=\n|⑥|$)/s,
-    concern: /⑥[:：]?\s*(.*)/s,
+  const rx = {
+    name: /①.*?：(.*?)(?=\n|$)/s,
+    birthdate: /②.*?：(.*?)(?=\n|$)/s,
+    birthtime: /③.*?：(.*?)(?=\n|$)/s,
+    mbti: /④.*?：(.*)/s,
   };
-  const out = {};
-  for (const [k, rx] of Object.entries(map)) {
-    const m = text.match(rx);
-    out[k] = m ? m[1].trim() : null;
+  const obj = {};
+  for (const [k, r] of Object.entries(rx)) {
+    const m = text.match(r);
+    obj[k] = m ? m[1].trim() : null;
   }
-  return out;
+  return obj;
 }
 
-function generatePrompt(d) {
-  return `以下の情報をもとに、プロの占い師が監修した自己分析を実施してください。
-名前：${d.name}
-生年月日：${d.birthdate}
-生まれた時間：${d.birthtime || '不明'}
-MBTI：${d.mbti || '不明'}
-動物占い：${d.animal_type || '不明'}
-相談内容：${d.concern}
-※全体で 1000 文字以内、やさしい語り口でまとめること`;
+function generateSelfPrompt(d) {
+  return `あなたは未来予報士アイです。算命学・四柱推命・九星気学・MBTI を総合し、以下の情報から無料セルフリーディング結果を作成してください。Markdown 記号は使わず、全角記号で見出しを入れます。\n\n【入力】\n名前：${d.name}\n生年月日：${d.birthdate}\n出生時間：${d.birthtime || '不明'}\nMBTI：${d.mbti || '不明'}\n\n【出力フォーマット】\n🔎無料セルフリーディング結果🔎\n未来予報士アイです。いただいた情報を分析し、あなたを多面的に読み解きました。\n\n――――――――――――――――\n◆性格キーワード\n・(3行)\n\n性格まとめ：150文字以内\n\n◆強み\n・(3行)\n\n強みまとめ：150文字以内\n\n◆いま抱えやすい課題\n・(3行)\n\n課題まとめ：150文字以内\n\n――――――――――――――――\n総合まとめ：300文字以内\n\n――――――――――――――――\nここまで読んでくださって、ほんとうにありがとうございます。少しでも「そうかも」と感じていただけたなら、私はとても嬉しいです。\n\nじつは……あなたへの【特別プレゼント】をひそかに用意しました。受け取ってみようかな、と思ったときに\n\n　特別プレゼント\n\nと一言だけ送ってくださいね。もちろん、今はゆっくり浸りたい方はそのままでも大丈夫。あなたのタイミングを大切に、そっとお待ちしています。`;
 }
 
 async function callGPT(prompt) {
   try {
-    const { data } = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.8,
+    const { data } = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.7,
+    }, {
+      headers: {
+        Authorization: `Bearer ${GPT_API_KEY}`,
+        'Content-Type': 'application/json',
       },
-      {
-        headers: {
-          Authorization: `Bearer ${GPT_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-      }
-    );
+    });
     return data.choices[0].message.content.trim();
   } catch (e) {
-    console.error('[GPT] error:', e.message);
-    return '診断中にエラーが発生しました。時間をおいて再試行してください。';
+    console.error('[GPT] error', e.message);
+    return '診断中にエラーが発生しました。時間を置いて再試行してください。';
   }
 }
 
 async function replyText(token, text) {
-  try {
-    await axios.post(
-      'https://api.line.me/v2/bot/message/reply',
-      { replyToken: token, messages: [{ type: 'text', text }] },
-      {
-        headers: {
-          Authorization: `Bearer ${CHANNEL_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-      }
-    );
-  } catch (e) {
-    console.error('[LINE] reply error:', e.message);
-  }
+  await axios.post('https://api.line.me/v2/bot/message/reply', {
+    replyToken: token,
+    messages: [{ type: 'text', text }],
+  }, {
+    headers: {
+      Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+  });
 }
 
-// ─────────────────────────────────────────
-app.listen(PORT, () => console.log(`Server on ${PORT}`));
+// ❼ 起動
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
