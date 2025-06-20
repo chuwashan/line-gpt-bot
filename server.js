@@ -202,8 +202,3 @@ async function replyText(token, text) {
 
 // ─────────────────────────────────────────
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
-{
-  "dependencies": {
-    "stripe": "^14.6.0"          // 追加
-  }
-}
