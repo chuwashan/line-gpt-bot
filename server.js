@@ -104,7 +104,7 @@ function generateSelfPrompt(d) {
 async function callGPT(prompt) {
   try {
     const { data } = await axios.post('https://api.openai.com/v1/chat/completions', {
-      model: 'OPENAI_MODEL',
+      model: OPENAI_MODEL,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.7,
     }, {
