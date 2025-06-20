@@ -18,7 +18,8 @@ require('dotenv').config();
 
 const PORT   = process.env.PORT || 3000;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const GPT_API_KEY  = process.env.OPENAI_API_KEY;
+const GPT_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-3.5-turbo';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -103,7 +104,7 @@ function generateSelfPrompt(d) {
 async function callGPT(prompt) {
   try {
     const { data } = await axios.post('https://api.openai.com/v1/chat/completions', {
-      model: 'gpt-4o',
+      model: 'OPENAI_MODEL',
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.7,
     }, {
