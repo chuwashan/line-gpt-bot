@@ -1,24 +1,26 @@
-// server.js
+// server.js（完全版：Supabase連携＋無料回数制限つき）
+require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
-require('dotenv').config();
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 環境変数
+// 環境変数の取得
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const GPT_API_KEY = process.env.OPENAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Supabaseクライアント初期化
+// Supabase クライアントの初期化
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 app.use(bodyParser.json());
 
+// Webhook エンドポイント
 app.post('/webhook', async (req, res) => {
   const events = req.body.events;
   if (!Array.isArray(events)) return res.sendStatus(200);
@@ -29,36 +31,66 @@ app.post('/webhook', async (req, res) => {
       const replyToken = event.replyToken;
       const userId = event.source.userId;
 
+      // ユーザー入力の抽出
       const userData = extractUserData(userMessage);
 
-      if (userData.name && userData.birthdate && userData.concern) {
-        const prompt = generatePrompt(userData);
-        const gptResult = await callGPT(prompt);
-
-        // Supabaseへ保存
-        await saveToSupabase({
-          user_id: userId,
-          ...userData,
-          diagnosis_result: gptResult
-        });
-
-        await replyText(replyToken, gptResult);
-      } else {
+      // 入力に診断キーワード含まれていなければスルー
+      if (!(userData.name && userData.birthdate && userData.concern)) {
         await replyText(replyToken, '📝 自己分析を行うために、①お名前、②生年月日、⑥相談内容をご記入ください。');
+        continue;
       }
+
+      // 無料回数チェック
+      const { data: existingLogs, error } = await supabase
+        .from('diagnosis_logs')
+        .select('*', { count: 'exact' })
+        .eq('user_id', userId);
+
+      if (error) {
+        console.error('Supabase 読み取りエラー:', error);
+        await replyText(replyToken, '診断履歴の確認中にエラーが発生しました。');
+        continue;
+      }
+
+      if (existingLogs.length >= 1) {
+        await replyText(replyToken, '🔒 無料診断は1回限りです。
+サブスクリプション登録で引き続きご利用いただけます！');
+        continue;
+      }
+
+      // GPT呼び出し
+      const prompt = generatePrompt(userData);
+      const gptResult = await callGPT(prompt);
+
+      // Supabaseに保存
+      await supabase.from('diagnosis_logs').insert({
+        id: uuidv4(),
+        user_id: userId,
+        name: userData.name,
+        birthdate: userData.birthdate,
+        birthtime: userData.time,
+        mbti: userData.mbti,
+        animal_type: userData.animal,
+        concern: userData.concern,
+        diagnosis_result: gptResult
+      });
+
+      // 返信
+      await replyText(replyToken, gptResult);
     }
   }
   res.sendStatus(200);
 });
 
+// ユーザー入力から情報を抽出
 function extractUserData(text) {
   const fields = {};
   const regexMap = {
     name: /①[:：]?\s*(.*?)(?=\n|②|$)/,
     birthdate: /②[:：]?\s*(.*?)(?=\n|③|$)/,
-    birthtime: /③[:：]?\s*(.*?)(?=\n|④|$)/,
+    time: /③[:：]?\s*(.*?)(?=\n|④|$)/,
     mbti: /④[:：]?\s*(.*?)(?=\n|⑤|$)/,
-    animal_type: /⑤[:：]?\s*(.*?)(?=\n|⑥|$)/,
+    animal: /⑤[:：]?\s*(.*?)(?=\n|⑥|$)/,
     concern: /⑥[:：]?\s*(.*)/
   };
 
@@ -66,20 +98,18 @@ function extractUserData(text) {
     const match = text.match(regex);
     fields[key] = match ? match[1].trim() : null;
   }
-
   return fields;
 }
 
 function generatePrompt(data) {
   return `以下の情報をもとに、プロの占い師が監修した自己分析を実施してください。\n
-名前：${data.name}
-生年月日：${data.birthdate}
-生まれた時間：${data.birthtime || '不明'}
-MBTI：${data.mbti || '不明'}
-動物占い：${data.animal_type || '不明'}
-相談内容：${data.concern}
-
-全体で1000文字以内におさめ、やさしい語り口で診断してください。`;
+名前：${data.name}\n
+生年月日：${data.birthdate}\n
+生まれた時間：${data.time || '不明'}\n
+MBTI：${data.mbti || '不明'}\n
+動物占い：${data.animal || '不明'}\n
+相談内容：${data.concern}\n
+\n全体で1000文字以内におさめ、やさしい語り口で診断してください。`;
 }
 
 async function callGPT(prompt) {
@@ -94,7 +124,6 @@ async function callGPT(prompt) {
         'Content-Type': 'application/json'
       }
     });
-
     return response.data.choices[0].message.content.trim();
   } catch (err) {
     console.error('GPT呼び出しエラー:', err.message);
@@ -115,18 +144,6 @@ async function replyText(replyToken, text) {
     });
   } catch (err) {
     console.error('LINE返信エラー:', err.message);
-  }
-}
-
-async function saveToSupabase(data) {
-  try {
-    const { error } = await supabase
-      .from('diagnosis_logs')
-      .insert([data]);
-
-    if (error) throw error;
-  } catch (err) {
-    console.error('Supabase保存エラー:', err.message);
   }
 }
 
