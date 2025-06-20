@@ -1,26 +1,23 @@
-// server.js（完全版：Supabase連携＋無料回数制限つき）
-require('dotenv').config();
+// server.js
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
-const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 環境変数の取得
+// 環境変数の読み込み
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const GPT_API_KEY = process.env.OPENAI_API_KEY;
-const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
 
-// Supabase クライアントの初期化
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 app.use(bodyParser.json());
 
-// Webhook エンドポイント
 app.post('/webhook', async (req, res) => {
   const events = req.body.events;
   if (!Array.isArray(events)) return res.sendStatus(200);
@@ -31,58 +28,54 @@ app.post('/webhook', async (req, res) => {
       const replyToken = event.replyToken;
       const userId = event.source.userId;
 
-      // ユーザー入力の抽出
       const userData = extractUserData(userMessage);
 
-      // 入力に診断キーワード含まれていなければスルー
-      if (!(userData.name && userData.birthdate && userData.concern)) {
+      // 必須項目がそろっているかチェック（①②⑥）
+      if (userData.name && userData.birthdate && userData.concern) {
+        // Supabase でユーザーの診断履歴を確認
+        const { data: history, error } = await supabase
+          .from('diagnosis_logs')
+          .select('*')
+          .eq('user_id', userId);
+
+        if (error) {
+          console.error('Supabaseエラー:', error);
+          await replyText(replyToken, 'エラーが発生しました。時間をおいて再試行してください。');
+          continue;
+        }
+
+        if (history.length > 0) {
+          await replyText(replyToken, '無料診断は1回限りです。');
+          continue;
+        }
+
+        // GPT呼び出し用プロンプト生成
+        const prompt = generatePrompt(userData);
+        const gptResult = await callGPT(prompt);
+
+        // 診断履歴を保存
+        await supabase.from('diagnosis_logs').insert([
+          {
+            user_id: userId,
+            name: userData.name,
+            birthdate: userData.birthdate,
+            birthtime: userData.time,
+            mbti: userData.mbti,
+            animal_type: userData.animal,
+            concern: userData.concern,
+            diagnosis_result: gptResult
+          }
+        ]);
+
+        await replyText(replyToken, gptResult);
+      } else {
         await replyText(replyToken, '📝 自己分析を行うために、①お名前、②生年月日、⑥相談内容をご記入ください。');
-        continue;
       }
-
-      // 無料回数チェック
-      const { data: existingLogs, error } = await supabase
-        .from('diagnosis_logs')
-        .select('*', { count: 'exact' })
-        .eq('user_id', userId);
-
-      if (error) {
-        console.error('Supabase 読み取りエラー:', error);
-        await replyText(replyToken, '診断履歴の確認中にエラーが発生しました。');
-        continue;
-      }
-
-      if (existingLogs.length >= 1) {
-        await replyText(replyToken, '無料診断は1回限りです。
-サブスクリプション登録で引き続きご利用いただけます！');
-        continue;
-      }
-
-      // GPT呼び出し
-      const prompt = generatePrompt(userData);
-      const gptResult = await callGPT(prompt);
-
-      // Supabaseに保存
-      await supabase.from('diagnosis_logs').insert({
-        id: uuidv4(),
-        user_id: userId,
-        name: userData.name,
-        birthdate: userData.birthdate,
-        birthtime: userData.time,
-        mbti: userData.mbti,
-        animal_type: userData.animal,
-        concern: userData.concern,
-        diagnosis_result: gptResult
-      });
-
-      // 返信
-      await replyText(replyToken, gptResult);
     }
   }
   res.sendStatus(200);
 });
 
-// ユーザー入力から情報を抽出
 function extractUserData(text) {
   const fields = {};
   const regexMap = {
@@ -93,7 +86,6 @@ function extractUserData(text) {
     animal: /⑤[:：]?\s*(.*?)(?=\n|⑥|$)/,
     concern: /⑥[:：]?\s*(.*)/
   };
-
   for (const [key, regex] of Object.entries(regexMap)) {
     const match = text.match(regex);
     fields[key] = match ? match[1].trim() : null;
