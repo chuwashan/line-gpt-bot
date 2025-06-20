@@ -53,7 +53,7 @@ app.post('/webhook', async (req, res) => {
       }
 
       if (existingLogs.length >= 1) {
-        await replyText(replyToken, '🔒 無料診断は1回限りです。
+        await replyText(replyToken, '無料診断は1回限りです。
 サブスクリプション登録で引き続きご利用いただけます！');
         continue;
       }
