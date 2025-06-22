@@ -167,14 +167,14 @@ app.post('/webhook', async (req, res) => {
             birth_time: data.birthtime || null,
             mbti: data.mbti || null,
             gender: data.gender,
-            diagnosis_result: analysisReport,
+            result: analysisReport,
             credit: 0,
           },
         ]);
       } catch (e) {
         console.error('[Supabase] diagnosis_logs insert error:', e.message);
       }
-    } else if (user.extra_credits === 2) {
+    } else if (user.extra_credits === 2 && !hasAllInput) {
       await replyText(replyToken, TEMPLATE_MSG);;
     }
   }
