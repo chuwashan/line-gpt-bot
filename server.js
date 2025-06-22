@@ -7,6 +7,10 @@
  *   ✔ 自己分析用プロンプト（system+user messages 方式）を統合
  *   ✔ スリーカード占い用プロンプト（system+user messages 方式）を統合
  *   ✔ callGPT() をメッセージ配列／文字列どちらも受け付ける汎用実装へ
+ * 2025-06-23
+ *   ✔ Supabase保存エラー修正
+ *   ✔ 変数スコープ問題修正
+ *   ✔ テンプレートメッセージ送信処理追加
  * ----------------------------------------------------------------------
  */
 
@@ -38,6 +42,7 @@ const TEMPLATE_MSG = `① お名前：
 ⑤ 性別（男性・女性・その他・不明）：
 
 上記5つをコピーしてご記入のうえ送ってくださいね🕊️`;
+
 const FOLLOWUP_MSG = `🕊️ よろしければ、今の気持ちを少しだけ教えてください 🕊️\n・心に残ったフレーズ\n・気づいたことや感想\n…どんなことでも大丈夫です。\n\n───────────────\nここまで大切なお時間をいただき、本当にありがとうございました。\nもしこのメッセージが、ほんの少しでも心に灯をともすものであったなら…\n私はとても幸せです。\n\nもっと深く自分を知りたいと感じたとき、\nもう少しだけ誰かに話を聞いてほしいと思ったときには、\nそっと立ち寄ってみてください。\n\n🪞初回500円プランなどもご用意しています。\n▶︎ https://coconala.com/invite/CR0VNB\n（新規登録で1,000pt付与→実質無料で受けられます）\n\n✨そして——\nThreadsでリポストや感想をシェアしていただけたら、励みになります。\nまた、不定期で**公式LINE限定の無料診断やココナラで使えるクーポン**などのキャンペーンも行っています。\n\n🌙 ぜひこのままご登録のまま、ゆったりとお待ちくださいね。\n\nあなたの旅路に、たくさんの愛と光が降り注ぎますように。`;
 
 // ❺ GPT プロンプトテンプレート
@@ -124,54 +129,68 @@ app.post('/webhook', async (req, res) => {
     const replyToken  = ev.replyToken;
     const text        = ev.message.text.trim();
 
-    // ------------ 最新ログ取得 (usersテーブル廃止) ------------
-    const { data: lastLog } = await supabase
-      .from('diagnosis_logs')
-      .select('*')
-      .eq('line_user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-    const extraCredits = lastLog?.extra_credits ?? 2;
-    const sessionClosed = lastLog?.session_closed ?? false;
+    try {
+      // ------------ 最新ログ取得 ------------
+      const { data: lastLog, error: logError } = await supabase
+        .from('diagnosis_logs')
+        .select('*')
+        .eq('line_user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
 
-    // ------------ セッション終了ユーザーは応答しない ------------
-    if (sessionClosed) {
-      res.sendStatus(200);
-      continue;
-    }
+      // ログが存在しない場合は初回ユーザーとして処理
+      const extraCredits = lastLog?.extra_credits ?? 2;
+      const sessionClosed = lastLog?.session_closed ?? false;
 
-    // ------------ 「特別プレゼント」でタロット実行 ------------
-    if (text === '特別プレゼント' && extraCredits === 1) {
-      const tarotAns = await callGPT(TAROT_MESSAGES(user.concern));
-      await replyText(replyToken, `${tarotAns}\n\n${FOLLOWUP_MSG}`);
-      // ログ挿入: タロット実行に伴い extra_credits を 0、session_closed を true に更新します
-await supabase.from('diagnosis_logs').insert([{
-  line_user_id: userId,
-  question: lastLog?.question || null,
-  result: tarotAns,
-  extra_credits: 0,
-  session_closed: true,
-}]);
-      continue;
-    }
+      console.log(`[DEBUG] userId: ${userId}, extraCredits: ${extraCredits}, sessionClosed: ${sessionClosed}`);
 
-    // ------------ 自己分析フロー ------------
-    const data = extractUserData(text);
-    const hasAllInput = data.name && data.birthdate && data.gender;
+      // ------------ セッション終了ユーザーは応答しない ------------
+      if (sessionClosed) {
+        console.log(`[INFO] Session closed for user: ${userId}`);
+        res.sendStatus(200);
+        continue;
+      }
 
-    if (hasAllInput && extraCredits === 2) {
-      const analysisReport = await callGPT(SELF_ANALYSIS_MESSAGES(data));
+      // ------------ 「特別プレゼント」でタロット実行 ------------
+      if (text === '特別プレゼント' && extraCredits === 1) {
+        console.log(`[INFO] Executing tarot for user: ${userId}`);
+        const tarotAns = await callGPT(TAROT_MESSAGES('相談内容なし'));
+        await replyText(replyToken, `${tarotAns}\n\n${FOLLOWUP_MSG}`);
+        
+        // ログ挿入: タロット実行
+        const { error: tarotLogError } = await supabase.from('diagnosis_logs').insert([{
+          line_user_id: userId,
+          question: lastLog?.question || null,
+          result: tarotAns,
+          extra_credits: 0,
+          session_closed: true,
+          name: lastLog?.name || null,
+          birthdate: lastLog?.birthdate || null,
+          birthtime: lastLog?.birthtime || null,
+          gender: lastLog?.gender || null,
+          mbti: lastLog?.mbti || null,
+        }]);
 
-      // LINE 返信
-      await replyText(replyToken, analysisReport);
+        if (tarotLogError) {
+          console.error('[Supabase] Tarot log insert error:', tarotLogError);
+        }
+        continue;
+      }
 
-      // users テーブル更新
-      // usersテーブル更新は廃止済み
+      // ------------ 自己分析フロー ------------
+      const data = extractUserData(text);
+      const hasAllInput = data.name && data.birthdate && data.gender;
 
-      // diagnosis_logs テーブル保存
-      try {
-        const { error } = await supabase.from('diagnosis_logs').insert([
+      if (hasAllInput && extraCredits === 2) {
+        console.log(`[INFO] Executing self-analysis for user: ${userId}`);
+        const analysisReport = await callGPT(SELF_ANALYSIS_MESSAGES(data));
+
+        // LINE 返信
+        await replyText(replyToken, analysisReport);
+
+        // diagnosis_logs テーブル保存
+        const { error: analysisLogError } = await supabase.from('diagnosis_logs').insert([
           {
             line_user_id: userId,
             name: data.name,
@@ -180,17 +199,32 @@ await supabase.from('diagnosis_logs').insert([{
             gender: data.gender,
             mbti: data.mbti || null,
             result: analysisReport,
-            extra_credits: extraCredits - 1,
+            extra_credits: 1, // 自己分析後は1クレジット残る
             session_closed: false,
             question: null,
           },
         ]);
-        if (error) throw error;
-      } catch (e) {
-        console.error('[Supabase] diagnosis_logs insert error:', e);
+
+        if (analysisLogError) {
+          console.error('[Supabase] Analysis log insert error:', analysisLogError);
+        }
+      } else if (extraCredits === 2 && !hasAllInput) {
+        // 初回ユーザーまたは不完全な入力の場合、テンプレートメッセージを送信
+        console.log(`[INFO] Sending template message to user: ${userId}`);
+        await replyText(replyToken, TEMPLATE_MSG);
+      } else {
+        // その他の場合（extraCredits が 1 で「特別プレゼント」以外のメッセージなど）
+        console.log(`[INFO] No action for user: ${userId}, message: ${text}`);
       }
-    } else if (extraCredits === 2 && !hasAllInput) {
-      ;
+
+    } catch (error) {
+      console.error('[ERROR] Processing webhook event:', error);
+      // エラーが発生した場合でも、LINEには成功レスポンスを返す
+      try {
+        await replyText(replyToken, '申し訳ございません。システムエラーが発生しました。しばらく時間をおいて再度お試しください。');
+      } catch (replyError) {
+        console.error('[ERROR] Failed to send error message:', replyError);
+      }
     }
   }
   res.sendStatus(200);
@@ -241,19 +275,24 @@ async function callGPT(input) {
 }
 
 async function replyText(token, text) {
-  await axios.post(
-    'https://api.line.me/v2/bot/message/reply',
-    {
-      replyToken: token,
-      messages: [{ type: 'text', text }],
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-        'Content-Type': 'application/json',
+  try {
+    await axios.post(
+      'https://api.line.me/v2/bot/message/reply',
+      {
+        replyToken: token,
+        messages: [{ type: 'text', text }],
       },
-    },
-  );
+      {
+        headers: {
+          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+      },
+    );
+  } catch (error) {
+    console.error('[LINE] Reply error:', error.message);
+    throw error;
+  }
 }
 
 // ❽ 起動
