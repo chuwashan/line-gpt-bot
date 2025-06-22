@@ -160,20 +160,21 @@ app.post('/webhook', async (req, res) => {
 
       // diagnosis_logs テーブル保存
       try {
-        await supabase.from('diagnosis_logs').insert([
-          {
-            name: data.name,
-            birthday: data.birthdate,
-            birth_time: data.birthtime || null,
-            mbti: data.mbti || null,
-            gender: data.gender,
-            result: analysisReport,
-            credit: 0,
-          },
-        ]);
-      } catch (e) {
-        console.error('[Supabase] diagnosis_logs insert error:', e.message);
-      }
+  const { error } = await supabase.from('diagnosis_logs').insert([
+    {
+      name: data.name,
+      birthday: data.birthdate,
+      birth_time: data.birthtime || null,
+      mbti: data.mbti || null,
+      gender: data.gender,
+      result: analysisReport,
+      credit: 0,
+    },
+  ]);
+  if (error) throw error;
+} catch (e) {
+  console.error('[Supabase] diagnosis_logs insert error:', e);
+}
     } else if (user.extra_credits === 2 && !hasAllInput) {
       ;
     }
