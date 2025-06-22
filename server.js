@@ -1,169 +1,205 @@
 /*
- * server.js  – LINE × Supabase × GPT  (1-table, Stripeなし軽量版)
- * ------------------------------------------------------------
- * 1. 自己分析：extra_credits 2 → 1
- * 2. 「特別プレゼント」：extra_credits 1 → 0 ＆ session_closed=true
- * 3. 以降は自動応答せず（感想などは手動対応）
- * モデルは環境変数 OPENAI_MODEL（例 gpt-4o-mini）で可変。
- * ------------------------------------------------------------
+ * server.js — LINE × Supabase × GPT  (未来予報士アイ 2025-06-22 性別＆プロンプト統合版)
+ * ----------------------------------------------------------------------
+ * 変更履歴
+ * 2025-06-22
+ *   ✔ gender カラム対応（入力・DB保存・GPTプロンプト）
+ *   ✔ 自己分析用プロンプト（system+user messages 方式）を統合
+ *   ✔ スリーカード占い用プロンプト（system+user messages 方式）を統合
+ *   ✔ callGPT() をメッセージ配列／文字列どちらも受け付ける汎用実装へ
+ * ----------------------------------------------------------------------
  */
 
-require('dotenv').config();
+// ❶ 依存モジュール & 環境変数
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
+require('dotenv').config();
 
-/* 環境変数 */
-const PORT                     = process.env.PORT || 3000;
+const PORT   = process.env.PORT || 3000;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const GPT_API_KEY              = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL             = process.env.OPENAI_MODEL || 'gpt-3.5-turbo';
-const SUPABASE_URL             = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE    = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const GPT_API_KEY  = process.env.OPENAI_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-/* Supabase */
+// ❷ Supabase クライアント
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
-/* Express */
+// ❸ Express 初期化
 const app = express();
 app.use(bodyParser.json());
 
-/* フォローアップ文 */
-const FOLLOWUP_MSG = `🕊️ ご感想を聞かせてください 🕊️
+// ❹ 固定メッセージ
+const FOLLOWUP_MSG = `🕊️ よろしければ、今の気持ちを少しだけ教えてください 🕊️\n・心に残ったフレーズ\n・気づいたことや感想\n…どんなことでも大丈夫です。\n\n───────────────\nここまで大切なお時間をいただき、本当にありがとうございました。\nもしこのメッセージが、ほんの少しでも心に灯をともすものであったなら…\n私はとても幸せです。\n\nもっと深く自分を知りたいと感じたとき、\nもう少しだけ誰かに話を聞いてほしいと思ったときには、\nそっと立ち寄ってみてください。\n\n🪞初回500円プランなどもご用意しています。\n▶︎ https://coconala.com/invite/CR0VNB\n（新規登録で1,000pt付与→実質無料で受けられます）\n\n✨そして——\nThreadsでリポストや感想をシェアしていただけたら、励みになります。\nまた、不定期で**公式LINE限定の無料診断やココナラで使えるクーポン**などのキャンペーンも行っています。\n\n🌙 ぜひこのままご登録のまま、ゆったりとお待ちくださいね。\n\nあなたの旅路に、たくさんの愛と光が降り注ぎますように。`;
 
-カードを通してお伝えしたメッセージが、少しでも心のやわらぎにつながっていれば幸いです。
+// ❺ GPT プロンプトテンプレート
+const SELF_ANALYSIS_MESSAGES = (d) => [
+  {
+    role: 'system',
+    content: `あなたは、未来予報士「アイ」として、LINE上で提供される自己分析診断の専門家です。
 
-・いちばん響いたフレーズ
-・気づいたこと など
-ふと思い浮かんだことがあれば一言お送りくださいね。
+あなたの役割は、占術（四柱推命・算命学・九星気学・旧姓名判断）およびMBTIなどの性格分類論を活用して、ユーザーの「魂の本質・今の状態・宿命の傾向・才能・課題」を、詩的かつ包容力のある言葉で読み解くことです。
 
-─────────
-【次のご案内】
-今回の無料特典はここまでとなりますが、
-もっと深く寄り添うサポートをご希望の方へ
-ココナラ専用プランをご用意しています。
+# トーンとスタイル
+- 詩的で静謐、上品で温かく、受容的かつ深い洞察に満ちた語り口
+- 感情に寄り添う優しい言葉づかい（🌙🕊️📩など絵文字も活用）
+- 読者が「読みながら癒され、導かれる」文章構成
+- 安易な断定は避け、「〜かもしれません」「〜という傾向があります」といった余白のある表現を使用
 
-▶︎ https://coconala.com/invite/CR0VNB
-(登録で1,000ptプレゼント／初回500円占いが実質無料)
+# 出力構成（以下のセクションで構成してください）
+1. 導入の詩的なメッセージ（心を映す鏡としての語り）
+2. 🔹 本質を映すことば（性格・価値観）
+3. 🔹 宿る星と運命の流れ（占術ベースの現在の流れ）
+4. 🔹 天賦の才能（生まれ持った強み）
+5. 🔹 今、少し疲れているかもしれないこと（課題や傾向）
+6. 詩的な締めのメッセージ＋「📩特別プレゼント」の誘導文（診断の導線）
 
-無理のない範囲でご検討ください。
-いつでもお待ちしています🌙
-─────────
+# 使う占術
+四柱推命・算命学・九星気学・旧姓名判断・MBTI。生年月日・出生時間・性別・MBTI情報を総合的に見て「読み解き」ます。断定しすぎず、読者の内面に寄り添うようにしてください。
 
-※占いが役に立ったと思っていただけたら、
-Threadsでリポストやコメントをいただけると励みになります🌸`;
+# 重要
+- 機械的・事務的・堅苦しい文体は禁止です。
+- 箇条書きとまとめは語彙・表現を変えて、重複を避けてください。
+- 300～600文字程度の濃厚で読み応えのある1本のストーリーのように。`
+  },
+  {
+    role: 'user',
+    content: `以下の診断情報をもとに、上記の形式とトーンで読み解いてください。\n\n【診断情報】\n名前：${d.name}\n生年月日：${d.birthdate}\n出生時間：${d.birthtime || '不明'}\n性別：${d.gender || '不明'}\nMBTI：${d.mbti || '不明'}`,
+  },
+];
 
-/* Webhook */
+const TAROT_MESSAGES = (concern = '相談内容なし') => [
+  {
+    role: 'system',
+    content: `あなたは「未来予報士アイ」として、多くの人の心に寄り添ってきた熟練の占い師です。
+
+▼ あなたの役割と出力目標：
+・スリーカードタロット（大アルカナ22枚）の【過去・現在・未来】3枚のカードに基づき、相談者の心に響くような鑑定文を出力してください。
+・語り口は「静謐でやさしく、詩的でありながら包容力と肯定感に満ちていて、相手の人生を深く理解し支えるような語り」を意識してください。
+・読み手が「本当に理解されている」と感じるような言葉を選び、単なる意味説明ではなく心に沁みる表現で伝えてください。
+・顧客満足度を最大化し、次の行動（感想送信、ココナラ訪問、LINE継続登録）につながるよう、愛と優しさが伝わる構成と導線を整えてください。
+
+▼ 出力構成（見出し・改行・絵文字含め厳守）：
+【導入】→カードと向き合う静かな導入\n【各カード】→カード名(日本語+英語+正逆)＋鑑定文\n【3枚のまとめ】→過去→現在→未来を物語としてまとめる\n【感想促しパート】→🕊️ よろしければ〜\n【愛を込めたクロージング】→固定文をそのまま
+
+# 重要
+- あなた自身で22枚の大アルカナからランダムに3枚を（過去・現在・未来の順）引き、正位置か逆位置もランダムに決定してください。
+- カードを引いたあと、必ず上記の構成で出力してください。
+- 意味解説にとどまらず相談者の心情や物語に寄り添った詩的な文章にしてください。`
+  },
+  {
+    role: 'user',
+    content: `相談内容：${concern}`,
+  },
+];
+
+// ❻ LINE Webhook エンドポイント
 app.post('/webhook', async (req, res) => {
   const events = req.body.events || [];
   for (const ev of events) {
     if (ev.type !== 'message' || ev.message.type !== 'text') continue;
 
-    const userId     = ev.source.userId;
-    const replyToken = ev.replyToken;
-    const text       = ev.message.text.trim();
+    const userId      = ev.source.userId;
+    const replyToken  = ev.replyToken;
+    const text        = ev.message.text.trim();
 
-    /* 行取得 or 新規挿入 (extra_credits=2) */
-    let { data: row } = await supabase
-      .from('diagnosis_logs')
-      .select('*')
-      .eq('id', userId)
-      .single();
-
-    if (!row) {
-      await supabase.from('diagnosis_logs')
-        .insert({ id: userId, extra_credits: 2, session_closed: false });
-      row = { id: userId, extra_credits: 2, session_closed: false };
+    // ------------ ユーザー情報取得 or 新規作成 ------------
+    let { data: user } = await supabase.from('users').select('*').eq('id', userId).single();
+    if (!user) {
+      await supabase.from('users').insert({ id: userId, extra_credits: 2, session_closed: false });
+      user = { id: userId, extra_credits: 2, session_closed: false };
     }
 
-    /* セッション終了なら無応答 */
-    if (row.session_closed) continue;
-
-    /* ───── 特別プレゼント：タロット ───── */
-    if (text === '特別プレゼント' && row.extra_credits === 1) {
-      const tarotPrompt = `あなたは未来予報士アイです。ユーザーの相談: 「${row.question || '相談内容なし'}」\
- を3枚タロットで過去・現在・未来に読み解き、日本語で800字以内で回答してください。Markdownは使わず、優しい語り口で。`;
-      const tarot = await callGPT(tarotPrompt);
-
-      await replyText(replyToken, `${tarot}\n\n${FOLLOWUP_MSG}`);
-
-      await supabase
-        .from('diagnosis_logs')
-        .update({ result: tarot, extra_credits: 0, session_closed: true })
-        .eq('id', userId);
-
+    // ------------ セッション終了ユーザーは応答しない ------------
+    if (user.session_closed) {
+      res.sendStatus(200);
       continue;
     }
 
-    /* ───── 自己分析フェーズ ───── */
-    if (row.extra_credits === 2) {
-      const data = extractUserData(text);
+    // ------------ 「特別プレゼント」でタロット実行 ------------
+    if (text === '特別プレゼント' && user.extra_credits === 1) {
+      const tarotAns = await callGPT(TAROT_MESSAGES(user.concern));
+      await replyText(replyToken, `${tarotAns}\n\n${FOLLOWUP_MSG}`);
+      await supabase.from('users').update({ extra_credits: 0, session_closed: true }).eq('id', userId);
+      continue;
+    }
 
-      if (data.name && data.birthdate) {
-        const prompt  = generateSelfPrompt(data);
-        const report  = await callGPT(prompt);
+    // ------------ 自己分析フロー ------------
+    const data = extractUserData(text);
+    const hasAllInput = data.name && data.birthdate && data.gender;
 
-        await replyText(replyToken, report);
+    if (hasAllInput && user.extra_credits === 2) {
+      const analysisReport = await callGPT(SELF_ANALYSIS_MESSAGES(data));
 
-        await supabase.from('diagnosis_logs').update({
-          ...data,
-          result: report,
-          extra_credits: 1
-        }).eq('id', userId);
+      // LINE 返信
+      await replyText(replyToken, analysisReport);
 
-      } else {
-        /* 入力案内（1 通だけ） */
-        await replyText(
-          replyToken,
-          'まずは①お名前②生年月日③出生時間④MBTI の情報をコピペでお送りください。'
-        );
+      // users テーブル更新
+      await supabase.from('users').update({ ...data, extra_credits: 1 }).eq('id', userId);
+
+      // diagnosis_logs テーブル保存
+      try {
+        await supabase.from('diagnosis_logs').insert([
+          {
+            name: data.name,
+            birthday: data.birthdate,
+            birth_time: data.birthtime || null,
+            mbti: data.mbti || null,
+            gender: data.gender,
+            diagnosis_result: analysisReport,
+            credit: 0,
+          },
+        ]);
+      } catch (e) {
+        console.error('[Supabase] diagnosis_logs insert error:', e.message);
       }
+    } else if (user.extra_credits === 2) {
+      await replyText(
+        replyToken,
+        'まずは①お名前②生年月日③出生時間④MBTI⑤性別 の情報をコピペでお送りください。',
+      );
     }
   }
   res.sendStatus(200);
 });
 
-/* ヘルパー群 */
-function extractUserData(txt) {
+// ❼ ヘルパー関数
+function extractUserData(text) {
   const rx = {
-    name      : /①.*?：(.*?)(?=\n|$)/s,
-    birthdate : /②.*?：(.*?)(?=\n|$)/s,
-    birthtime : /③.*?：(.*?)(?=\n|$)/s,
-    mbti      : /④.*?：(.*)/s,
-    question  : /相談.*?：(.*)/s
+    name: /①.*?：(.*?)(?=\n|$)/s,
+    birthdate: /②.*?：(.*?)(?=\n|$)/s,
+    birthtime: /③.*?：(.*?)(?=\n|$)/s,
+    mbti: /④.*?：(.*?)(?=\n|$)/s,
+    gender: /⑤.*?：(.*?)(?=\n|$)/s,
   };
-  const out = {};
+  const obj = {};
   for (const [k, r] of Object.entries(rx)) {
-    const m = txt.match(r);
-    if (m) out[k] = m[1].trim();
+    const m = text.match(r);
+    obj[k] = m ? m[1].trim() : null;
   }
-  return out;
+  return obj;
 }
 
-function generateSelfPrompt(d) {
-  return `あなたは未来予報士アイです。算命学・四柱推命・九星気学・MBTI を総合し、以下の情報から自己分析レポートを作成してください。Markdown記号は使わず、日本語で出力。\n\
-名前:${d.name}\n生年月日:${d.birthdate}\n出生時間:${d.birthtime || '不明'}\nMBTI:${d.mbti || '不明'}\n\n\
-🔎無料セルフリーディング結果🔎\n未来予報士アイです。いただいた情報を分析し、あなたを多面的に読み解きました。\n\
-――――――――――――――――\n◆性格キーワード\n・(3行)\n\n性格まとめ：150文字以内\n\n◆強み\n・(3行)\n\n強みまとめ：150文字以内\n\n◆いま抱えやすい課題\n・(3行)\n\n課題まとめ：150文字以内\n\n――――――――――――――――\n総合まとめ：300文字以内\n\n――――――――――――――――\nここまで読んでくださって、ほんとうにありがとうございます。少しでも「そうかも」と感じていただけたなら私はとても嬉しいです。\n\
-じつは……あなたへの【特別プレゼント】をひそかに用意しました。受け取ってみようかなと思ったときに\n\n　特別プレゼント\n\nと一言だけ送ってくださいね。もちろん今はゆっくり浸りたい方はそのままでも大丈夫。あなたのタイミングを大切にそっとお待ちしています。`;
-}
+async function callGPT(input) {
+  const payload = Array.isArray(input)
+    ? { messages: input }
+    : { messages: [{ role: 'user', content: input }] };
 
-async function callGPT(prompt) {
   try {
     const { data } = await axios.post(
       'https://api.openai.com/v1/chat/completions',
       {
-        model: OPENAI_MODEL,
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.7
+        model: 'gpt-4o',
+        temperature: 0.7,
+        ...payload,
       },
       {
         headers: {
           Authorization: `Bearer ${GPT_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      }
+          'Content-Type': 'application/json',
+        },
+      },
     );
     return data.choices[0].message.content.trim();
   } catch (e) {
@@ -175,10 +211,18 @@ async function callGPT(prompt) {
 async function replyText(token, text) {
   await axios.post(
     'https://api.line.me/v2/bot/message/reply',
-    { replyToken: token, messages: [{ type: 'text', text }] },
-    { headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` } }
+    {
+      replyToken: token,
+      messages: [{ type: 'text', text }],
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+    },
   );
 }
 
-/* 起動 */
+// ❽ 起動
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
