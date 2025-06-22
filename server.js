@@ -159,7 +159,7 @@ app.post('/webhook', async (req, res) => {
       await supabase.from('users').update({ ...data, extra_credits: 1 }).eq('id', userId);
 
       // diagnosis_logs テーブル保存
-      try {
+try {
   const { error } = await supabase.from('diagnosis_logs').insert([
     {
       name: data.name,
@@ -168,7 +168,9 @@ app.post('/webhook', async (req, res) => {
       mbti: data.mbti || null,
       gender: data.gender,
       result: analysisReport,
-      credit: 0,
+      question: data.question || null,
+      extra_credits: user.extra_credits,
+      session_closed: false,
     },
   ]);
   if (error) throw error;
