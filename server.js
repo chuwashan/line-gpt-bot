@@ -1,16 +1,12 @@
 /*
- * server.js — LINE × Supabase × GPT  (未来予報士アイ 2025-06-22 性別＆プロンプト統合版)
+ * server.js — LINE × Supabase × GPT  (セキュリティ・監視強化版)
  * ----------------------------------------------------------------------
- * 変更履歴
- * 2025-06-22
- *   ✔ gender カラム対応（入力・DB保存・GPTプロンプト）
- *   ✔ 自己分析用プロンプト（system+user messages 方式）を統合
- *   ✔ スリーカード占い用プロンプト（system+user messages 方式）を統合
- *   ✔ callGPT() をメッセージ配列／文字列どちらも受け付ける汎用実装へ
- * 2025-06-23
- *   ✔ Supabase保存エラー修正
- *   ✔ 変数スコープ問題修正
- *   ✔ テンプレートメッセージ送信処理追加
+ * 追加機能
+ * ✔ LINE署名検証でなりすまし防止
+ * ✔ 構造化ログによる詳細な動作記録
+ * ✔ エラー監視とアラート機能
+ * ✔ レート制限による不正利用防止
+ * ✔ セキュリティヘッダーとヘルスチェック
  * ----------------------------------------------------------------------
  */
 
@@ -18,23 +14,131 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const winston = require('winston');
 require('dotenv').config();
 
 const PORT   = process.env.PORT || 3000;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET; // 🔒 署名検証用
 const GPT_API_KEY  = process.env.OPENAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL; // 🚨 アラート用（任意）
 
-// ❷ Supabase クライアント
+// ❷ ログ設定
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  defaultMeta: { service: 'line-ai-bot' },
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple()
+      )
+    })
+  ]
+});
+
+// ❃ Supabase クライアント
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
-// ❸ Express 初期化
+// ❹ Express 初期化とセキュリティ設定
 const app = express();
+
+// 🔒 セキュリティヘッダー
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
+
+// Raw bodyが必要（署名検証のため）
+app.use('/webhook', bodyParser.raw({ type: 'application/json' }));
 app.use(bodyParser.json());
 
-// ❹ 固定メッセージ
+// ❺ レート制限（メモリ内実装）
+const rateLimit = new Map();
+const RATE_LIMIT_WINDOW = 60000; // 1分
+const RATE_LIMIT_MAX = 10; // 1分間に10回まで
+
+function checkRateLimit(userId) {
+  const now = Date.now();
+  const userRequests = rateLimit.get(userId) || [];
+  const recentRequests = userRequests.filter(time => now - time < RATE_LIMIT_WINDOW);
+  
+  if (recentRequests.length >= RATE_LIMIT_MAX) {
+    logger.warn('Rate limit exceeded', { userId, requestCount: recentRequests.length });
+    return false;
+  }
+  
+  recentRequests.push(now);
+  rateLimit.set(userId, recentRequests);
+  return true;
+}
+
+// ❻ LINE署名検証
+function verifyLineSignature(body, signature) {
+  if (!LINE_CHANNEL_SECRET) {
+    logger.error('LINE_CHANNEL_SECRET not configured');
+    return false;
+  }
+  
+  const hash = crypto
+    .createHmac('sha256', LINE_CHANNEL_SECRET)
+    .update(body)
+    .digest('base64');
+  
+  const isValid = hash === signature;
+  
+  if (!isValid) {
+    logger.warn('Invalid LINE signature', { 
+      expected: hash.substring(0, 10) + '...', 
+      received: signature?.substring(0, 10) + '...' 
+    });
+  }
+  
+  return isValid;
+}
+
+// ❼ エラー通知機能
+async function notifyError(error, context = {}) {
+  const errorInfo = {
+    timestamp: new Date().toISOString(),
+    error: error.message,
+    stack: error.stack,
+    context
+  };
+  
+  logger.error('Critical error occurred', errorInfo);
+  
+  // Slack通知（設定されている場合）
+  if (SLACK_WEBHOOK_URL) {
+    try {
+      await axios.post(SLACK_WEBHOOK_URL, {
+        text: `🚨 LINE Bot Error Alert`,
+        attachments: [{
+          color: 'danger',
+          fields: [
+            { title: 'Error', value: error.message, short: false },
+            { title: 'Context', value: JSON.stringify(context, null, 2), short: false }
+          ]
+        }]
+      });
+    } catch (slackError) {
+      logger.error('Failed to send Slack notification', { error: slackError.message });
+    }
+  }
+}
+
+// ❽ 固定メッセージ
 const TEMPLATE_MSG = `① お名前：
 ② 生年月日（西暦）：
 ③ 生まれた時間（不明でもOK）：
@@ -45,7 +149,7 @@ const TEMPLATE_MSG = `① お名前：
 
 const FOLLOWUP_MSG = `🕊️ よろしければ、今の気持ちを少しだけ教えてください 🕊️\n・心に残ったフレーズ\n・気づいたことや感想\n…どんなことでも大丈夫です。\n\n───────────────\nここまで大切なお時間をいただき、本当にありがとうございました。\nもしこのメッセージが、ほんの少しでも心に灯をともすものであったなら…\n私はとても幸せです。\n\nもっと深く自分を知りたいと感じたとき、\nもう少しだけ誰かに話を聞いてほしいと思ったときには、\nそっと立ち寄ってみてください。\n\n🪞初回500円プランなどもご用意しています。\n▶︎ https://coconala.com/invite/CR0VNB\n（新規登録で1,000pt付与→実質無料で受けられます）\n\n✨そして——\nThreadsでリポストや感想をシェアしていただけたら、励みになります。\nまた、不定期で**公式LINE限定の無料診断やココナラで使えるクーポン**などのキャンペーンも行っています。\n\n🌙 ぜひこのままご登録のまま、ゆったりとお待ちくださいね。\n\nあなたの旅路に、たくさんの愛と光が降り注ぎますように。`;
 
-// ❺ GPT プロンプトテンプレート
+// ❾ GPT プロンプトテンプレート
 const SELF_ANALYSIS_MESSAGES = (d) => [
   {
     role: 'system',
@@ -119,46 +223,116 @@ const TAROT_MESSAGES = (concern = '相談内容なし') => [
   },
 ];
 
-// ❻ LINE Webhook エンドポイント
+// ❿ ヘルスチェックエンドポイント
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
+// ⓫ LINE Webhook エンドポイント（セキュリティ強化版）
 app.post('/webhook', async (req, res) => {
-  const events = req.body.events || [];
-  for (const ev of events) {
-    if (ev.type !== 'message' || ev.message.type !== 'text') continue;
+  const startTime = Date.now();
+  let requestId = crypto.randomUUID();
+  
+  try {
+    // 🔒 署名検証
+    const signature = req.headers['x-line-signature'];
+    if (!verifyLineSignature(req.body, signature)) {
+      logger.warn('Unauthorized webhook request', { 
+        requestId,
+        ip: req.ip,
+        userAgent: req.headers['user-agent']
+      });
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
 
-    const userId      = ev.source.userId;
-    const replyToken  = ev.replyToken;
-    const text        = ev.message.text.trim();
+    const body = JSON.parse(req.body);
+    const events = body.events || [];
+    
+    logger.info('Webhook request received', {
+      requestId,
+      eventCount: events.length,
+      destination: body.destination
+    });
 
-    try {
-      // ------------ 最新ログ取得 ------------
+    for (const ev of events) {
+      if (ev.type !== 'message' || ev.message.type !== 'text') {
+        logger.debug('Skipping non-text message', { requestId, eventType: ev.type });
+        continue;
+      }
+
+      const userId = ev.source.userId;
+      const replyToken = ev.replyToken;
+      const text = ev.message.text.trim();
+
+      // 📊 ユーザーアクション記録
+      logger.info('User message received', {
+        requestId,
+        userId: userId.substring(0, 8) + '***', // プライバシー保護
+        messageLength: text.length,
+        messagePreview: text.substring(0, 20) + (text.length > 20 ? '...' : '')
+      });
+
+      // 🚫 レート制限チェック
+      if (!checkRateLimit(userId)) {
+        logger.warn('Rate limit exceeded for user', { requestId, userId });
+        await replyText(replyToken, '申し訳ございません。少しお時間をおいてから再度お試しください。');
+        continue;
+      }
+
+      // 📋 ユーザー状態取得
       const { data: lastLog, error: logError } = await supabase
         .from('diagnosis_logs')
-        .select('*')
+        .select('extra_credits, session_closed, question, name, birthdate, birthtime, gender, mbti')
         .eq('line_user_id', userId)
         .order('created_at', { ascending: false })
         .limit(1)
         .single();
 
-      // ログが存在しない場合は初回ユーザーとして処理
-      const extraCredits = lastLog?.extra_credits ?? 2;
-      const sessionClosed = lastLog?.session_closed ?? false;
-
-      console.log(`[DEBUG] userId: ${userId}, extraCredits: ${extraCredits}, sessionClosed: ${sessionClosed}`);
-
-      // ------------ セッション終了ユーザーは応答しない ------------
-      if (sessionClosed) {
-        console.log(`[INFO] Session closed for user: ${userId}`);
-        res.sendStatus(200);
+      if (logError && logError.code !== 'PGRST116') { // PGRST116 = No rows found
+        logger.error('Database query error', { requestId, error: logError, userId });
+        await notifyError(new Error('Database query failed'), { requestId, userId, operation: 'getUserState' });
+        await replyText(replyToken, 'システムエラーが発生しました。しばらく時間をおいて再度お試しください。');
         continue;
       }
 
-      // ------------ 「特別プレゼント」でタロット実行 ------------
+      const extraCredits = lastLog?.extra_credits ?? 2;
+      const sessionClosed = lastLog?.session_closed ?? false;
+
+      logger.info('User state retrieved', {
+        requestId,
+        userId: userId.substring(0, 8) + '***',
+        extraCredits,
+        sessionClosed
+      });
+
+      // セッション終了チェック
+      if (sessionClosed) {
+        logger.info('Session closed user ignored', { requestId, userId });
+        continue;
+      }
+
+      // 🔮 「特別プレゼント」でタロット実行
       if (text === '特別プレゼント' && extraCredits === 1) {
-        console.log(`[INFO] Executing tarot for user: ${userId}`);
-        const tarotAns = await callGPT(TAROT_MESSAGES('相談内容なし'));
+        logger.info('Executing tarot reading', { requestId, userId });
+        
+        const tarotStartTime = Date.now();
+        const tarotAns = await callGPT(TAROT_MESSAGES('相談内容なし'), requestId);
+        const tarotDuration = Date.now() - tarotStartTime;
+        
+        logger.info('Tarot reading completed', { 
+          requestId, 
+          userId,
+          duration: tarotDuration,
+          responseLength: tarotAns.length 
+        });
+
         await replyText(replyToken, `${tarotAns}\n\n${FOLLOWUP_MSG}`);
         
-        // ログ挿入: タロット実行
+        // DB保存
         const { error: tarotLogError } = await supabase.from('diagnosis_logs').insert([{
           line_user_id: userId,
           question: lastLog?.question || null,
@@ -173,64 +347,101 @@ app.post('/webhook', async (req, res) => {
         }]);
 
         if (tarotLogError) {
-          console.error('[Supabase] Tarot log insert error:', tarotLogError);
+          logger.error('Tarot log insert error', { requestId, error: tarotLogError });
+          await notifyError(tarotLogError, { requestId, userId, operation: 'tarotLogInsert' });
         }
         continue;
       }
 
-      // ------------ 自己分析フロー ------------
+      // 🧠 自己分析フロー
       const data = extractUserData(text);
       const hasAllInput = data.name && data.birthdate && data.gender;
 
       if (hasAllInput && extraCredits === 2) {
-        console.log(`[INFO] Executing self-analysis for user: ${userId}`);
-        const analysisReport = await callGPT(SELF_ANALYSIS_MESSAGES(data));
+        logger.info('Executing self-analysis', { 
+          requestId, 
+          userId,
+          userData: {
+            hasName: !!data.name,
+            hasBirthdate: !!data.birthdate,
+            hasGender: !!data.gender,
+            hasMbti: !!data.mbti
+          }
+        });
+        
+        const analysisStartTime = Date.now();
+        const analysisReport = await callGPT(SELF_ANALYSIS_MESSAGES(data), requestId);
+        const analysisDuration = Date.now() - analysisStartTime;
+        
+        logger.info('Self-analysis completed', { 
+          requestId, 
+          userId,
+          duration: analysisDuration,
+          responseLength: analysisReport.length 
+        });
 
-        // LINE 返信
         await replyText(replyToken, analysisReport);
 
-        // diagnosis_logs テーブル保存
-        const { error: analysisLogError } = await supabase.from('diagnosis_logs').insert([
-          {
-            line_user_id: userId,
-            name: data.name,
-            birthdate: data.birthdate,
-            birthtime: data.birthtime || null,
-            gender: data.gender,
-            mbti: data.mbti || null,
-            result: analysisReport,
-            extra_credits: 1, // 自己分析後は1クレジット残る
-            session_closed: false,
-            question: null,
-          },
-        ]);
+        // DB保存
+        const { error: analysisLogError } = await supabase.from('diagnosis_logs').insert([{
+          line_user_id: userId,
+          name: data.name,
+          birthdate: data.birthdate,
+          birthtime: data.birthtime || null,
+          gender: data.gender,
+          mbti: data.mbti || null,
+          result: analysisReport,
+          extra_credits: 1,
+          session_closed: false,
+          question: null,
+        }]);
 
         if (analysisLogError) {
-          console.error('[Supabase] Analysis log insert error:', analysisLogError);
+          logger.error('Analysis log insert error', { requestId, error: analysisLogError });
+          await notifyError(analysisLogError, { requestId, userId, operation: 'analysisLogInsert' });
         }
       } else if (extraCredits === 2 && !hasAllInput) {
-        // 初回ユーザーまたは不完全な入力の場合、テンプレートメッセージを送信
-        console.log(`[INFO] Sending template message to user: ${userId}`);
+        logger.info('Sending template message', { requestId, userId });
         await replyText(replyToken, TEMPLATE_MSG);
       } else {
-        // その他の場合（extraCredits が 1 で「特別プレゼント」以外のメッセージなど）
-        console.log(`[INFO] No action for user: ${userId}, message: ${text}`);
-      }
-
-    } catch (error) {
-      console.error('[ERROR] Processing webhook event:', error);
-      // エラーが発生した場合でも、LINEには成功レスポンスを返す
-      try {
-        await replyText(replyToken, '申し訳ございません。システムエラーが発生しました。しばらく時間をおいて再度お試しください。');
-      } catch (replyError) {
-        console.error('[ERROR] Failed to send error message:', replyError);
+        logger.info('No action taken', { 
+          requestId, 
+          userId, 
+          extraCredits, 
+          hasAllInput,
+          messagePreview: text.substring(0, 50)
+        });
       }
     }
+
+    const totalDuration = Date.now() - startTime;
+    logger.info('Webhook request completed', { requestId, duration: totalDuration });
+    
+  } catch (error) {
+    const totalDuration = Date.now() - startTime;
+    logger.error('Webhook processing error', { 
+      requestId, 
+      error: error.message, 
+      stack: error.stack,
+      duration: totalDuration 
+    });
+    
+    await notifyError(error, { requestId, operation: 'webhookProcessing' });
+    
+    try {
+      if (req.body && JSON.parse(req.body).events?.[0]?.replyToken) {
+        const replyToken = JSON.parse(req.body).events[0].replyToken;
+        await replyText(replyToken, 'システムエラーが発生しました。しばらく時間をおいて再度お試しください。');
+      }
+    } catch (replyError) {
+      logger.error('Failed to send error reply', { requestId, error: replyError.message });
+    }
   }
+  
   res.sendStatus(200);
 });
 
-// ❼ ヘルパー関数
+// ⓬ ヘルパー関数
 function extractUserData(text) {
   const rx = {
     name: /①.*?：(.*?)(?=\n|$)/s,
@@ -247,30 +458,63 @@ function extractUserData(text) {
   return obj;
 }
 
-async function callGPT(input) {
+async function callGPT(input, requestId = 'unknown') {
   const payload = Array.isArray(input)
     ? { messages: input }
     : { messages: [{ role: 'user', content: input }] };
 
-  try {
-    const { data } = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4o',
-        temperature: 0.7,
-        ...payload,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${GPT_API_KEY}`,
-          'Content-Type': 'application/json',
+  const maxRetries = 3;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      logger.info('GPT API call started', { 
+        requestId, 
+        attempt, 
+        messageCount: payload.messages.length 
+      });
+
+      const { data } = await axios.post(
+        'https://api.openai.com/v1/chat/completions',
+        {
+          model: 'gpt-4o',
+          temperature: 0.7,
+          max_tokens: 1500,
+          ...payload,
         },
-      },
-    );
-    return data.choices[0].message.content.trim();
-  } catch (e) {
-    console.error('[GPT] error', e.message);
-    return '診断中にエラーが発生しました。時間を置いて再試行してください。';
+        {
+          headers: {
+            Authorization: `Bearer ${GPT_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 30000, // 30秒タイムアウト
+        },
+      );
+
+      logger.info('GPT API call successful', { 
+        requestId, 
+        attempt,
+        tokensUsed: data.usage?.total_tokens || 'unknown',
+        responseLength: data.choices[0].message.content.length
+      });
+
+      return data.choices[0].message.content.trim();
+      
+    } catch (e) {
+      logger.error('GPT API call failed', { 
+        requestId, 
+        attempt, 
+        error: e.message,
+        isLastAttempt: attempt === maxRetries
+      });
+
+      if (attempt === maxRetries) {
+        await notifyError(e, { requestId, operation: 'gptApiCall', finalAttempt: true });
+        return '診断中にエラーが発生しました。時間を置いて再試行してください。';
+      }
+      
+      // 指数バックオフ
+      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
   }
 }
 
@@ -287,13 +531,40 @@ async function replyText(token, text) {
           Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
           'Content-Type': 'application/json',
         },
+        timeout: 10000, // 10秒タイムアウト
       },
     );
+    
+    logger.info('LINE reply sent successfully', { 
+      replyToken: token.substring(0, 10) + '***',
+      messageLength: text.length 
+    });
+    
   } catch (error) {
-    console.error('[LINE] Reply error:', error.message);
+    logger.error('LINE reply failed', { 
+      replyToken: token.substring(0, 10) + '***',
+      error: error.message 
+    });
     throw error;
   }
 }
 
-// ❽ 起動
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// ⓭ 起動
+app.listen(PORT, () => {
+  logger.info('Server started successfully', { 
+    port: PORT, 
+    nodeEnv: process.env.NODE_ENV || 'development',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// プロセス終了時のクリーンアップ
+process.on('SIGTERM', () => {
+  logger.info('Received SIGTERM, shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  logger.info('Received SIGINT, shutting down gracefully');
+  process.exit(0);
+});
