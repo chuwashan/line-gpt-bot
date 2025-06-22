@@ -164,7 +164,7 @@ app.post('/webhook', async (req, res) => {
     {
       name: data.name,
       birthday: data.birthdate,
-      birth_time: data.birthtime || null,
+      birthtime: data.birthtime || null,
       mbti: data.mbti || null,
       gender: data.gender,
       result: analysisReport,
