@@ -175,7 +175,7 @@ app.post('/webhook', async (req, res) => {
         console.error('[Supabase] diagnosis_logs insert error:', e.message);
       }
     } else if (user.extra_credits === 2 && !hasAllInput) {
-      await replyText(replyToken, TEMPLATE_MSG);;
+      ;
     }
   }
   res.sendStatus(200);
