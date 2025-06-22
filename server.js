@@ -498,7 +498,18 @@ app.post('/webhook', async (req, res) => {
           responseLength: analysisReport.length 
         });
 
-        await replyText(replyToken, analysisReport);
+        await replyWithQuickReply(
+          replyToken, 
+          analysisReport,
+          [{
+            type: 'action',
+            action: {
+              type: 'message',
+              label: '🎁 特別プレゼントを受け取る',
+              text: '特別プレゼント'
+            }
+          }]
+        );
 
         // 自己分析結果で更新（extra_credits: 1）
         const { error: updateError } = await supabase
