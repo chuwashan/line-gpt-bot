@@ -136,13 +136,13 @@ app.post('/webhook', async (req, res) => {
     const sessionClosed = lastLog?.session_closed ?? false;
 
     // ------------ セッション終了ユーザーは応答しない ------------
-    if (user.session_closed) {
+    if (sessionClosed) {
       res.sendStatus(200);
       continue;
     }
 
     // ------------ 「特別プレゼント」でタロット実行 ------------
-    if (text === '特別プレゼント' && user.extra_credits === 1) {
+    if (text === '特別プレゼント' && extraCredits === 1) {
       const tarotAns = await callGPT(TAROT_MESSAGES(user.concern));
       await replyText(replyToken, `${tarotAns}\n\n${FOLLOWUP_MSG}`);
       // ログ挿入: タロット実行に伴い extra_credits を 0、session_closed を true に更新します
@@ -160,14 +160,14 @@ await supabase.from('diagnosis_logs').insert([{
     const data = extractUserData(text);
     const hasAllInput = data.name && data.birthdate && data.gender;
 
-    if (hasAllInput && user.extra_credits === 2) {
+    if (hasAllInput && extraCredits === 2) {
       const analysisReport = await callGPT(SELF_ANALYSIS_MESSAGES(data));
 
       // LINE 返信
       await replyText(replyToken, analysisReport);
 
       // users テーブル更新
-      await supabase.from('users').update({ ...data, extra_credits: 1 }).eq('id', userId);
+      // usersテーブル更新は廃止済み
 
       // diagnosis_logs テーブル保存
       try {
@@ -186,7 +186,7 @@ await supabase.from('diagnosis_logs').insert([{
 } catch (e) {
   console.error('[Supabase] diagnosis_logs insert error:', e);
 }
-    } else if (user.extra_credits === 2 && !hasAllInput) {
+    } else if (extraCredits === 2 && !hasAllInput) {
       ;
     }
   }
