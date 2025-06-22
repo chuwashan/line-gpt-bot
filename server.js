@@ -171,21 +171,24 @@ await supabase.from('diagnosis_logs').insert([{
 
       // diagnosis_logs テーブル保存
       try {
-  const { error } = await supabase.from('diagnosis_logs').insert([
-    {
-      name: data.name,
-      birthday: data.birthdate,
-      birthtime: data.birthtime || null,
-      mbti: data.mbti || null,
-      gender: data.gender,
-      result: analysisReport,
-      credit: 0,
-    },
-  ]);
-  if (error) throw error;
-} catch (e) {
-  console.error('[Supabase] diagnosis_logs insert error:', e);
-}
+        const { error } = await supabase.from('diagnosis_logs').insert([
+          {
+            line_user_id: userId,
+            name: data.name,
+            birthdate: data.birthdate,
+            birthtime: data.birthtime || null,
+            gender: data.gender,
+            mbti: data.mbti || null,
+            result: analysisReport,
+            extra_credits: extraCredits - 1,
+            session_closed: false,
+            question: null,
+          },
+        ]);
+        if (error) throw error;
+      } catch (e) {
+        console.error('[Supabase] diagnosis_logs insert error:', e);
+      }
     } else if (extraCredits === 2 && !hasAllInput) {
       ;
     }
