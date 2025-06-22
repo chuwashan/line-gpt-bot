@@ -208,19 +208,61 @@ const TAROT_MESSAGES = (concern = '相談内容なし') => [
 ・スリーカードタロット（大アルカナ22枚）の【過去・現在・未来】3枚のカードに基づき、相談者の心に響くような鑑定文を出力してください。
 ・語り口は「静謐でやさしく、詩的でありながら包容力と肯定感に満ちていて、相手の人生を深く理解し支えるような語り」を意識してください。
 ・読み手が「本当に理解されている」と感じるような言葉を選び、単なる意味説明ではなく心に沁みる表現で伝えてください。
-・顧客満足度を最大化し、次の行動（感想送信、ココナラ訪問、LINE継続登録）につながるよう、愛と優しさが伝わる構成と導線を整えてください。
 
 ▼ 出力構成（見出し・改行・絵文字含め厳守）：
-【導入】→カードと向き合う静かな導入\n【各カード】→カード名(日本語+英語+正逆)＋鑑定文\n【3枚のまとめ】→過去→現在→未来を物語としてまとめる\n【感想促しパート】→🕊️ よろしければ〜\n【愛を込めたクロージング】→固定文をそのまま
+静かな導入文（カードと向き合う情景描写）
+
+【今回引かれたカード】
+🔹過去：カード名（日本語 / 英語）- 正位置/逆位置
+　鑑定文（そのカードが示す過去の物語）
+
+🔹現在：カード名（日本語 / 英語）- 正位置/逆位置
+　鑑定文（そのカードが示す現在の状態）
+
+🔹未来：カード名（日本語 / 英語）- 正位置/逆位置
+　鑑定文（そのカードが示す未来への示唆）
+
+✨ 3枚のカードが紡ぐあなたの物語を、もう少し詳しくお伝えしますね。
 
 # 重要
 - あなた自身で22枚の大アルカナからランダムに3枚を（過去・現在・未来の順）引き、正位置か逆位置もランダムに決定してください。
 - カードを引いたあと、必ず上記の構成で出力してください。
-- 意味解説にとどまらず相談者の心情や物語に寄り添った詩的な文章にしてください。`
+- 意味解説にとどまらず相談者の心情や物語に寄り添った詩的な文章にしてください。
+- 最後は必ず「✨ 3枚のカードが紡ぐあなたの物語を、もう少し詳しくお伝えしますね。」で締めてください。`
   },
   {
     role: 'user',
     content: `相談内容：${concern}`,
+  },
+];
+
+const TAROT_SUMMARY_MESSAGES = (cards, concern) => [
+  {
+    role: 'system',
+    content: `あなたは「未来予報士アイ」として、先ほど引いた3枚のタロットカードの総合的な物語を紡ぎます。
+
+▼ 出力内容：
+先ほど引いたカード（${cards}）が示す、過去から現在、そして未来への流れを、一つの美しい物語として詳しく語ってください。
+
+▼ 構成：
+【3枚のカードが紡ぐ物語】
+
+過去のカードが示していたのは...（過去の状況と学び）
+
+そして現在のカードは...（今の状態と向き合うべきこと）
+
+未来のカードが導くのは...（これからの可能性と希望）
+
+この3枚のカードを通して伝えたいメッセージ...（全体を通しての深い洞察とエール）
+
+▼ トーン：
+- 詩的で温かく、相談者の心に寄り添う語り口
+- 希望と励ましに満ちた前向きなメッセージ
+- 相談内容（${concern}）に対する具体的な示唆を含める`
+  },
+  {
+    role: 'user',
+    content: '3枚のカードの総合的な物語をお願いします。',
   },
 ];
 
@@ -343,16 +385,31 @@ app.post('/webhook', async (req, res) => {
           concern: text.substring(0, 30)
         });
 
-        await replyText(replyToken, `${tarotAns}\n\n${FOLLOWUP_MSG}`);
+        // カード情報を抽出して保存（まとめ生成用）
+        const cardInfo = extractTarotCards(tarotAns);
         
-        // タロット結果で更新（extra_credits: 0, session_closed: true）
+        // クイックリプライ付きで返信
+        await replyWithQuickReply(
+          replyToken, 
+          tarotAns,
+          [{
+            type: 'action',
+            action: {
+              type: 'message',
+              label: '📖 今回のまとめを見る',
+              text: '今回のまとめ'
+            }
+          }]
+        );
+        
+        // タロット結果を保存（まだsession_closedはfalse）
         const { error: updateError } = await supabase
           .from('diagnosis_logs')
           .update({
             tarot_concern: text,
             tarot_result: tarotAns,
-            extra_credits: 0,
-            session_closed: true,
+            tarot_cards: cardInfo, // カード情報を保存
+            extra_credits: 0.3, // まとめ待機状態
             updated_at: new Date().toISOString()
           })
           .eq('line_user_id', userId);
@@ -360,6 +417,50 @@ app.post('/webhook', async (req, res) => {
         if (updateError) {
           logger.error('Tarot update error', { requestId, error: updateError });
           await notifyError(updateError, { requestId, userId, operation: 'tarotUpdate' });
+        }
+        continue;
+      }
+
+      // 📖 タロットまとめ表示（extra_credits: 0.3の時）
+      if (text === '今回のまとめ' && extraCredits === 0.3) {
+        logger.info('Generating tarot summary', { requestId, userId });
+        
+        // 保存されているカード情報を取得
+        const { tarot_cards: cards, tarot_concern: concern } = userState;
+        
+        const summaryStartTime = Date.now();
+        const summaryAns = await callGPT(TAROT_SUMMARY_MESSAGES(cards || '', concern || ''), requestId);
+        const summaryDuration = Date.now() - summaryStartTime;
+        
+        logger.info('Tarot summary completed', { 
+          requestId, 
+          userId,
+          duration: summaryDuration,
+          responseLength: summaryAns.length 
+        });
+
+        // まとめを送信
+        await replyText(replyToken, summaryAns);
+        
+        // 少し間を置いてフォローアップメッセージを送信
+        setTimeout(async () => {
+          await pushMessage(userId, FOLLOWUP_MSG);
+        }, 2000);
+        
+        // 最終更新（extra_credits: 0, session_closed: true）
+        const { error: updateError } = await supabase
+          .from('diagnosis_logs')
+          .update({
+            tarot_summary: summaryAns,
+            extra_credits: 0,
+            session_closed: true,
+            updated_at: new Date().toISOString()
+          })
+          .eq('line_user_id', userId);
+
+        if (updateError) {
+          logger.error('Summary update error', { requestId, error: updateError });
+          await notifyError(updateError, { requestId, userId, operation: 'summaryUpdate' });
         }
         continue;
       }
@@ -630,6 +731,91 @@ async function replyText(token, text) {
     });
     throw error;
   }
+}
+
+// 🆕 クイックリプライ付き返信
+async function replyWithQuickReply(token, text, quickReplyItems) {
+  try {
+    await axios.post(
+      'https://api.line.me/v2/bot/message/reply',
+      {
+        replyToken: token,
+        messages: [{
+          type: 'text',
+          text: text,
+          quickReply: {
+            items: quickReplyItems
+          }
+        }]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 10000
+      }
+    );
+    
+    logger.info('LINE reply with quick reply sent successfully', { 
+      replyToken: token.substring(0, 10) + '***',
+      quickReplyCount: quickReplyItems.length 
+    });
+    
+  } catch (error) {
+    logger.error('LINE reply with quick reply failed', { 
+      replyToken: token.substring(0, 10) + '***',
+      error: error.message 
+    });
+    throw error;
+  }
+}
+
+// 🆕 プッシュメッセージ送信
+async function pushMessage(userId, text) {
+  try {
+    await axios.post(
+      'https://api.line.me/v2/bot/message/push',
+      {
+        to: userId,
+        messages: [{ type: 'text', text }]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 10000
+      }
+    );
+    
+    logger.info('LINE push message sent successfully', { 
+      userId: userId.substring(0, 10) + '***',
+      messageLength: text.length 
+    });
+    
+  } catch (error) {
+    logger.error('LINE push message failed', { 
+      userId: userId.substring(0, 10) + '***',
+      error: error.message 
+    });
+    throw error;
+  }
+}
+
+// 🆕 タロットカード情報抽出
+function extractTarotCards(tarotResult) {
+  // カード名を抽出する簡易的な実装
+  // 実際の出力形式に応じて調整が必要
+  const cardPattern = /🔹(過去|現在|未来)：(.+?)（.+?\/.+?）\s*-\s*(正位置|逆位置)/g;
+  const matches = [...tarotResult.matchAll(cardPattern)];
+  
+  return matches.map(match => ({
+    position: match[1],
+    nameJa: match[2],
+    nameEn: match[3],
+    orientation: match[4]
+  })).map(card => `${card.position}:${card.nameJa}`).join(', ');
 }
 
 // ⓭ 起動
