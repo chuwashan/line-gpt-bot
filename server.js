@@ -1,5 +1,5 @@
 /*
- * server.js — LINE × Supabase × GPT  (セキュリティ・監視強化版)
+ * server.js — LINE × Supabase × GPT  (セキュリティ・監視強化版 + ユーザー管理改善)
  * ----------------------------------------------------------------------
  * 追加機能
  * ✔ LINE署名検証でなりすまし防止
@@ -7,6 +7,7 @@
  * ✔ エラー監視とアラート機能
  * ✔ レート制限による不正利用防止
  * ✔ セキュリティヘッダーとヘルスチェック
+ * ✔ ユーザーごとの状態管理（重複レコード防止）
  * ----------------------------------------------------------------------
  */
 
@@ -283,24 +284,15 @@ app.post('/webhook', async (req, res) => {
         continue;
       }
 
-      // 📋 ユーザー状態取得
-      const { data: lastLog, error: logError } = await supabase
-        .from('diagnosis_logs')
-        .select('extra_credits, session_closed, question, name, birthdate, birthtime, gender, mbti')
-        .eq('line_user_id', userId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
-
-      if (logError && logError.code !== 'PGRST116') { // PGRST116 = No rows found
-        logger.error('Database query error', { requestId, error: logError, userId });
-        await notifyError(new Error('Database query failed'), { requestId, userId, operation: 'getUserState' });
+      // 📋 ユーザー状態取得 or 作成
+      const userState = await getOrCreateUserState(userId, requestId);
+      
+      if (!userState) {
         await replyText(replyToken, 'システムエラーが発生しました。しばらく時間をおいて再度お試しください。');
         continue;
       }
 
-      const extraCredits = lastLog?.extra_credits ?? 2;
-      const sessionClosed = lastLog?.session_closed ?? false;
+      const { extra_credits: extraCredits, session_closed: sessionClosed } = userState;
 
       logger.info('User state retrieved', {
         requestId,
@@ -315,40 +307,59 @@ app.post('/webhook', async (req, res) => {
         continue;
       }
 
-      // 🔮 「特別プレゼント」でタロット実行
+      // 🔮 「特別プレゼント」の場合はLINE側で応答するので何もしない
       if (text === '特別プレゼント' && extraCredits === 1) {
-        logger.info('Executing tarot reading', { requestId, userId });
+        logger.info('Special present keyword detected - handled by LINE auto-response', { requestId, userId });
+        
+        // extra_creditsだけ更新（タロット待機状態へ）
+        const { error: updateError } = await supabase
+          .from('diagnosis_logs')
+          .update({
+            extra_credits: 0.5, // タロット待機状態を示す中間値
+            updated_at: new Date().toISOString()
+          })
+          .eq('line_user_id', userId);
+
+        if (updateError) {
+          logger.error('Credit update error', { requestId, error: updateError });
+          await notifyError(updateError, { requestId, userId, operation: 'creditUpdate' });
+        }
+        continue;
+      }
+
+      // 🎴 タロット相談内容受付（extra_credits: 0.5の時）
+      if (extraCredits === 0.5) {
+        logger.info('Executing tarot reading with concern', { requestId, userId });
         
         const tarotStartTime = Date.now();
-        const tarotAns = await callGPT(TAROT_MESSAGES('相談内容なし'), requestId);
+        const tarotAns = await callGPT(TAROT_MESSAGES(text), requestId);
         const tarotDuration = Date.now() - tarotStartTime;
         
         logger.info('Tarot reading completed', { 
           requestId, 
           userId,
           duration: tarotDuration,
-          responseLength: tarotAns.length 
+          responseLength: tarotAns.length,
+          concern: text.substring(0, 30)
         });
 
         await replyText(replyToken, `${tarotAns}\n\n${FOLLOWUP_MSG}`);
         
-        // DB保存
-        const { error: tarotLogError } = await supabase.from('diagnosis_logs').insert([{
-          line_user_id: userId,
-          question: lastLog?.question || null,
-          result: tarotAns,
-          extra_credits: 0,
-          session_closed: true,
-          name: lastLog?.name || null,
-          birthdate: lastLog?.birthdate || null,
-          birthtime: lastLog?.birthtime || null,
-          gender: lastLog?.gender || null,
-          mbti: lastLog?.mbti || null,
-        }]);
+        // タロット結果で更新（extra_credits: 0, session_closed: true）
+        const { error: updateError } = await supabase
+          .from('diagnosis_logs')
+          .update({
+            tarot_concern: text,
+            tarot_result: tarotAns,
+            extra_credits: 0,
+            session_closed: true,
+            updated_at: new Date().toISOString()
+          })
+          .eq('line_user_id', userId);
 
-        if (tarotLogError) {
-          logger.error('Tarot log insert error', { requestId, error: tarotLogError });
-          await notifyError(tarotLogError, { requestId, userId, operation: 'tarotLogInsert' });
+        if (updateError) {
+          logger.error('Tarot update error', { requestId, error: updateError });
+          await notifyError(updateError, { requestId, userId, operation: 'tarotUpdate' });
         }
         continue;
       }
@@ -356,6 +367,12 @@ app.post('/webhook', async (req, res) => {
       // 🧠 自己分析フロー
       const data = extractUserData(text);
       const hasAllInput = data.name && data.birthdate && data.gender;
+
+      // 「診断開始」の場合はLINE側で応答するので何もしない
+      if (text === '診断開始' && extraCredits === 2) {
+        logger.info('Diagnosis start keyword detected - handled by LINE auto-response', { requestId, userId });
+        continue;
+      }
 
       if (hasAllInput && extraCredits === 2) {
         logger.info('Executing self-analysis', { 
@@ -382,27 +399,30 @@ app.post('/webhook', async (req, res) => {
 
         await replyText(replyToken, analysisReport);
 
-        // DB保存
-        const { error: analysisLogError } = await supabase.from('diagnosis_logs').insert([{
-          line_user_id: userId,
-          name: data.name,
-          birthdate: data.birthdate,
-          birthtime: data.birthtime || null,
-          gender: data.gender,
-          mbti: data.mbti || null,
-          result: analysisReport,
-          extra_credits: 1,
-          session_closed: false,
-          question: null,
-        }]);
+        // 自己分析結果で更新（extra_credits: 1）
+        const { error: updateError } = await supabase
+          .from('diagnosis_logs')
+          .update({
+            name: data.name,
+            birthdate: data.birthdate,
+            birthtime: data.birthtime || null,
+            gender: data.gender,
+            mbti: data.mbti || null,
+            self_analysis_result: analysisReport,
+            extra_credits: 1,
+            session_closed: false,
+            updated_at: new Date().toISOString()
+          })
+          .eq('line_user_id', userId);
 
-        if (analysisLogError) {
-          logger.error('Analysis log insert error', { requestId, error: analysisLogError });
-          await notifyError(analysisLogError, { requestId, userId, operation: 'analysisLogInsert' });
+        if (updateError) {
+          logger.error('Analysis update error', { requestId, error: updateError });
+          await notifyError(updateError, { requestId, userId, operation: 'analysisUpdate' });
         }
-      } else if (extraCredits === 2 && !hasAllInput) {
-        logger.info('Sending template message', { requestId, userId });
-        await replyText(replyToken, TEMPLATE_MSG);
+      } else if (extraCredits === 2 && !hasAllInput && text !== '診断開始') {
+        // 「診断開始」以外のメッセージで、まだ情報が揃っていない場合
+        logger.info('Incomplete user data - ignoring message', { requestId, userId });
+        // 何も返信しない（LINEの自動応答に任せる）
       } else {
         logger.info('No action taken', { 
           requestId, 
@@ -456,6 +476,69 @@ function extractUserData(text) {
     obj[k] = m ? m[1].trim() : null;
   }
   return obj;
+}
+
+// 🆕 ユーザー状態取得/作成関数
+async function getOrCreateUserState(userId, requestId) {
+  try {
+    // まず既存のユーザーレコードを確認
+    const { data: existingUser, error: selectError } = await supabase
+      .from('diagnosis_logs')
+      .select('*')
+      .eq('line_user_id', userId)
+      .single();
+
+    if (selectError && selectError.code !== 'PGRST116') { // PGRST116 = No rows found
+      logger.error('Database query error', { requestId, error: selectError, userId });
+      await notifyError(selectError, { requestId, userId, operation: 'getUserState' });
+      return null;
+    }
+
+    // ユーザーが存在する場合はそのまま返す
+    if (existingUser) {
+      logger.info('Existing user found', { 
+        requestId, 
+        userId: userId.substring(0, 8) + '***',
+        extraCredits: existingUser.extra_credits,
+        sessionClosed: existingUser.session_closed
+      });
+      return existingUser;
+    }
+
+    // 新規ユーザーの場合は作成
+    logger.info('Creating new user record', { requestId, userId: userId.substring(0, 8) + '***' });
+    
+    const { data: newUser, error: insertError } = await supabase
+      .from('diagnosis_logs')
+      .insert([{
+        line_user_id: userId,
+        extra_credits: 2,
+        session_closed: false,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (insertError) {
+      logger.error('Failed to create new user', { requestId, error: insertError, userId });
+      await notifyError(insertError, { requestId, userId, operation: 'createNewUser' });
+      return null;
+    }
+
+    logger.info('New user created successfully', { 
+      requestId, 
+      userId: userId.substring(0, 8) + '***',
+      extraCredits: newUser.extra_credits
+    });
+    
+    return newUser;
+    
+  } catch (error) {
+    logger.error('Unexpected error in getOrCreateUserState', { requestId, error: error.message, userId });
+    await notifyError(error, { requestId, userId, operation: 'getOrCreateUserState' });
+    return null;
+  }
 }
 
 async function callGPT(input, requestId = 'unknown') {
