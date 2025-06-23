@@ -676,6 +676,34 @@ function extractUserData(text) {
   return obj;
 }
 
+// 🆕 診断番号生成（人気感を演出）
+function generateDiagnosisNumber() {
+  const now = new Date();
+  const year = now.getFullYear().toString().slice(-2); // 25
+  const month = (now.getMonth() + 1).toString().padStart(2, '0'); // 06
+  const day = now.getDate().toString().padStart(2, '0'); // 24
+  
+  // ランダムな4桁（1000-9999）で人気感を演出
+  const randomNum = Math.floor(Math.random() * 9000) + 1000;
+  
+  return `#${year}${month}${day}-${randomNum}`;
+}
+
+// 🆕 時間帯に応じた挨拶
+function getTimeBasedGreeting() {
+  const hour = new Date().getHours();
+  
+  if (hour >= 5 && hour < 10) {
+    return 'おはようございます。\n朝の澄んだ空気の中で';
+  } else if (hour >= 10 && hour < 17) {
+    return 'こんにちは。\n穏やかな時間の中で';
+  } else if (hour >= 17 && hour < 21) {
+    return 'こんばんは。\n夕暮れの静寂の中で';
+  } else {
+    return 'こんばんは。\n静かな夜の時間に';
+  }
+}
+
 // 🆕 ユーザー状態取得/作成関数
 async function getOrCreateUserState(userId, requestId) {
   try {
@@ -862,6 +890,44 @@ async function replyWithQuickReply(token, text, quickReplyItems) {
   } catch (error) {
     logger.error('LINE reply with quick reply failed', { 
       replyToken: token.substring(0, 10) + '***',
+      error: error.message 
+    });
+    throw error;
+  }
+}
+
+// 🆕 タイピングインジケーター表示
+async function showTypingIndicator(userId, duration = 10000) {
+  try {
+    // LINEのtyping indicatorは最大20秒まで
+    const actualDuration = Math.min(duration, 20000);
+    
+    await axios.post(
+      'https://api.line.me/v2/bot/chat/loading/start',
+      {
+        chatId: userId,
+        loadingSeconds: Math.floor(actualDuration / 1000)
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 5000
+      }
+    );
+    
+    logger.info('Typing indicator started', { 
+      userId: userId.substring(0, 10) + '***',
+      duration: actualDuration 
+    });
+    
+    // 指定時間待機
+    await new Promise(resolve => setTimeout(resolve, actualDuration));
+    
+  } catch (error) {
+    logger.error('Typing indicator failed', { 
+      userId: userId.substring(0, 10) + '***',
       error: error.message 
     });
     throw error;
