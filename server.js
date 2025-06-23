@@ -405,14 +405,9 @@ app.post('/webhook', async (req, res) => {
         });
 
         // プレミアムな演出を追加したタロット結果
-        const timeGreeting = getTimeBasedGreeting();
-        const premiumTarot = `━━━━━━━━━━━━━━━
-${timeGreeting}
-
-あなたの想いに寄り添いながら
+        const premiumTarot = `あなたの想いに寄り添いながら
 3枚のカードが紡ぐ物語を
 お伝えいたします。
-━━━━━━━━━━━━━━━
 
 ${tarotAns}`;
 
