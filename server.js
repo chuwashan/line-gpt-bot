@@ -455,6 +455,42 @@ ${tarotAns}`;
         // フォローアップメッセージを送信
         await replyText(replyToken, FOLLOWUP_MSG);
         
+        // 少し遅れてシェアボタンを表示
+        setTimeout(async () => {
+          const shareMessage = `無料の心理診断見つけた！\nhttps://lin.ee/aQZAOEo`;
+          
+          await pushMessageWithQuickReply(
+            userId,
+            '✨ もしよろしければ、お友達にも教えてあげてくださいね',
+            [
+              {
+                type: 'action',
+                action: {
+                  type: 'uri',
+                  label: '📱 LINEで共有',
+                  uri: `https://line.me/R/msg/text/?${encodeURIComponent(shareMessage)}`
+                }
+              },
+              {
+                type: 'action',
+                action: {
+                  type: 'uri',
+                  label: '🐦 Xで共有',
+                  uri: `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareMessage)}`
+                }
+              },
+              {
+                type: 'action',
+                action: {
+                  type: 'clipboard',
+                  label: '📷 Instagramにコピー',
+                  clipboardText: shareMessage
+                }
+              }
+            ]
+          );
+        }, 3000); // 3秒後
+        
         // 最終更新（extra_credits: 0, session_closed: true）
         const { error: updateError } = await supabase
           .from('diagnosis_logs')
@@ -686,12 +722,17 @@ function generateDiagnosisNumber() {
   // ランダムな4桁（1000-9999）で人気感を演出
   const randomNum = Math.floor(Math.random() * 9000) + 1000;
   
-  return `#${year}${month}${day}-${randomNum}`;
+  // 記号を使って電話番号として認識されないようにする
+  return `診断番号: ${year}${month}${day}/${randomNum}`;
 }
 
-// 🆕 時間帯に応じた挨拶
+// 🆕 時間帯に応じた挨拶（日本時間対応）
 function getTimeBasedGreeting() {
-  const hour = new Date().getHours();
+  // 日本時間を取得（UTC+9）
+  const now = new Date();
+  const jstOffset = 9 * 60; // 9時間を分に変換
+  const jstTime = new Date(now.getTime() + jstOffset * 60 * 1000);
+  const hour = jstTime.getHours();
   
   if (hour >= 5 && hour < 10) {
     return 'おはようございます。\n朝の澄んだ空気の中で';
@@ -959,6 +1000,44 @@ async function pushMessage(userId, text) {
     
   } catch (error) {
     logger.error('LINE push message failed', { 
+      userId: userId.substring(0, 10) + '***',
+      error: error.message 
+    });
+    throw error;
+  }
+}
+
+// 🆕 クイックリプライ付きプッシュメッセージ
+async function pushMessageWithQuickReply(userId, text, quickReplyItems) {
+  try {
+    await axios.post(
+      'https://api.line.me/v2/bot/message/push',
+      {
+        to: userId,
+        messages: [{
+          type: 'text',
+          text: text,
+          quickReply: {
+            items: quickReplyItems
+          }
+        }]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 10000
+      }
+    );
+    
+    logger.info('LINE push message with quick reply sent successfully', { 
+      userId: userId.substring(0, 10) + '***',
+      quickReplyCount: quickReplyItems.length 
+    });
+    
+  } catch (error) {
+    logger.error('LINE push message with quick reply failed', { 
       userId: userId.substring(0, 10) + '***',
       error: error.message 
     });
