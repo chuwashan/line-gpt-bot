@@ -381,6 +381,17 @@ app.post('/webhook', async (req, res) => {
       if (extraCredits === 0.5) {
         logger.info('Executing tarot reading with concern', { requestId, userId });
         
+        // タイピングインジケーターを10秒間表示
+        try {
+          await showTypingIndicator(userId, 10000);
+          logger.info('Typing indicator shown for tarot', { requestId, userId });
+        } catch (typingError) {
+          logger.error('Failed to show typing indicator', { 
+            requestId, 
+            error: typingError.message 
+          });
+        }
+        
         const tarotStartTime = Date.now();
         const tarotAns = await callGPT(TAROT_MESSAGES(text), requestId);
         const tarotDuration = Date.now() - tarotStartTime;
@@ -393,10 +404,22 @@ app.post('/webhook', async (req, res) => {
           concern: text.substring(0, 30)
         });
 
+        // プレミアムな演出を追加したタロット結果
+        const timeGreeting = getTimeBasedGreeting();
+        const premiumTarot = `━━━━━━━━━━━━━━━
+${timeGreeting}
+
+あなたの想いに寄り添いながら
+3枚のカードが紡ぐ物語を
+お伝えいたします。
+━━━━━━━━━━━━━━━
+
+${tarotAns}`;
+
         // タロット結果を送信（カード解説とストーリーを含む）
         await replyWithQuickReply(
           replyToken, 
-          tarotAns,
+          premiumTarot,
           [{
             type: 'action',
             action: {
@@ -471,6 +494,18 @@ app.post('/webhook', async (req, res) => {
           }
         });
         
+        // タイピングインジケーターを10秒間表示
+        try {
+          await showTypingIndicator(userId, 10000);
+          logger.info('Typing indicator shown', { requestId, userId });
+        } catch (typingError) {
+          logger.error('Failed to show typing indicator', { 
+            requestId, 
+            error: typingError.message 
+          });
+          // タイピング表示に失敗しても処理は続行
+        }
+        
         const analysisStartTime = Date.now();
         const analysisReport = await callGPT(SELF_ANALYSIS_MESSAGES(data), requestId);
         const analysisDuration = Date.now() - analysisStartTime;
@@ -482,9 +517,23 @@ app.post('/webhook', async (req, res) => {
           responseLength: analysisReport.length 
         });
 
+        // プレミアムな演出を追加した診断結果
+        const diagnosisNumber = generateDiagnosisNumber();
+        const timeGreeting = getTimeBasedGreeting();
+        const premiumReport = `━━━━━━━━━━━━━━━
+診断番号: ${diagnosisNumber}
+
+${timeGreeting}
+${data.name}さまのために
+心を込めて紡いだ
+特別な診断結果をお届けします。
+━━━━━━━━━━━━━━━
+
+${analysisReport}`;
+
         await replyWithQuickReply(
           replyToken, 
-          analysisReport,
+          premiumReport,
           [{
             type: 'action',
             action: {
@@ -495,7 +544,7 @@ app.post('/webhook', async (req, res) => {
           }]
         );
 
-        // 自己分析結果で更新（extra_credits: 1）
+        // 自己分析結果で更新（extra_credits: 1）+ 診断番号も保存
         const { error: updateError } = await supabase
           .from('diagnosis_logs')
           .update({
@@ -505,6 +554,7 @@ app.post('/webhook', async (req, res) => {
             gender: data.gender,
             mbti: data.mbti || null,
             self_analysis_result: analysisReport,
+            diagnosis_number: diagnosisNumber,
             extra_credits: 1,
             session_closed: false,
             input_error_count: 0, // エラーカウントをリセット
