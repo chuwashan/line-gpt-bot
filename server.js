@@ -207,7 +207,6 @@ const TAROT_MESSAGES = (concern = '相談内容なし') => [
 ▼ あなたの役割と出力目標：
 ・スリーカードタロット（大アルカナ22枚）の【過去・現在・未来】3枚のカードに基づき、相談者の心に響くような鑑定文を出力してください。
 ・語り口は「静謐でやさしく、詩的でありながら包容力と肯定感に満ちていて、相手の人生を深く理解し支えるような語り」を意識してください。
-・読み手が「本当に理解されている」と感じるような言葉を選び、単なる意味説明ではなく心に沁みる表現で伝えてください。
 
 ▼ 出力構成（見出し・改行・絵文字含め厳守）：
 静かな導入文（カードと向き合う情景描写）
@@ -222,29 +221,6 @@ const TAROT_MESSAGES = (concern = '相談内容なし') => [
 🔹未来：カード名（日本語 / 英語）- 正位置/逆位置
 　鑑定文（そのカードが示す未来への示唆）
 
-✨ 3枚のカードが紡ぐあなたの物語を、もう少し詳しくお伝えしますね。
-
-# 重要
-- あなた自身で22枚の大アルカナからランダムに3枚を（過去・現在・未来の順）引き、正位置か逆位置もランダムに決定してください。
-- カードを引いたあと、必ず上記の構成で出力してください。
-- 意味解説にとどまらず相談者の心情や物語に寄り添った詩的な文章にしてください。
-- 最後は必ず「✨ 3枚のカードが紡ぐあなたの物語を、もう少し詳しくお伝えしますね。」で締めてください。`
-  },
-  {
-    role: 'user',
-    content: `相談内容：${concern}`,
-  },
-];
-
-const TAROT_SUMMARY_MESSAGES = (cards, concern) => [
-  {
-    role: 'system',
-    content: `あなたは「未来予報士アイ」として、先ほど引いた3枚のタロットカードの総合的な物語を紡ぎます。
-
-▼ 出力内容：
-先ほど引いたカード（${cards}）が示す、過去から現在、そして未来への流れを、一つの美しい物語として詳しく語ってください。
-
-▼ 構成：
 【3枚のカードが紡ぐ物語】
 
 過去のカードが示していたのは...（過去の状況と学び）
@@ -253,18 +229,20 @@ const TAROT_SUMMARY_MESSAGES = (cards, concern) => [
 
 未来のカードが導くのは...（これからの可能性と希望）
 
-この3枚のカードを通して伝えたいメッセージ...（全体を通しての深い洞察とエール）
+この3枚のカードを通して伝えたいメッセージ...（全体を通しての深い洞察と、相談内容「${concern}」への具体的なエール）
 
-▼ トーン：
-- 詩的で温かく、相談者の心に寄り添う語り口
-- 希望と励ましに満ちた前向きなメッセージ
-- 相談内容（${concern}）に対する具体的な示唆を含める`
+# 重要
+- あなた自身で22枚の大アルカナからランダムに3枚を（過去・現在・未来の順）引き、正位置か逆位置もランダムに決定してください。
+- カードを引いたあと、必ず上記の構成で出力してください。
+- 個別のカード解説と、3枚の総合的な物語の両方を一度に出力してください。`
   },
   {
     role: 'user',
-    content: '3枚のカードの総合的な物語をお願いします。',
+    content: `相談内容：${concern}`,
   },
 ];
+
+// 削除：TAROT_SUMMARY_MESSAGESは不要になったため
 
 // ❿ ヘルスチェックエンドポイント
 app.get('/health', (req, res) => {
@@ -385,10 +363,7 @@ app.post('/webhook', async (req, res) => {
           concern: text.substring(0, 30)
         });
 
-        // カード情報を抽出して保存（まとめ生成用）
-        const cardInfo = extractTarotCards(tarotAns);
-        
-        // クイックリプライ付きで返信
+        // タロット結果を送信（カード解説とストーリーを含む）
         await replyWithQuickReply(
           replyToken, 
           tarotAns,
@@ -396,20 +371,19 @@ app.post('/webhook', async (req, res) => {
             type: 'action',
             action: {
               type: 'message',
-              label: '📖 今回のまとめを見る',
-              text: '今回のまとめ'
+              label: '💝 特別なご案内を見る',
+              text: '特別なご案内'
             }
           }]
         );
         
-        // タロット結果を保存（まだsession_closedはfalse）
+        // タロット結果を保存
         const { error: updateError } = await supabase
           .from('diagnosis_logs')
           .update({
             tarot_concern: text,
             tarot_result: tarotAns,
-            tarot_cards: cardInfo, // カード情報を保存
-            extra_credits: 0.3, // まとめ待機状態
+            extra_credits: 0.3, // 特別案内待機状態
             updated_at: new Date().toISOString()
           })
           .eq('line_user_id', userId);
@@ -421,37 +395,17 @@ app.post('/webhook', async (req, res) => {
         continue;
       }
 
-      // 📖 タロットまとめ表示（extra_credits: 0.3の時）
-      if (text === '今回のまとめ' && extraCredits === 0.3) {
-        logger.info('Generating tarot summary', { requestId, userId });
+      // 💝 特別なご案内表示（extra_credits: 0.3の時）
+      if (text === '特別なご案内' && extraCredits === 0.3) {
+        logger.info('Showing special announcement', { requestId, userId });
         
-        // 保存されているカード情報を取得
-        const { tarot_cards: cards, tarot_concern: concern } = userState;
-        
-        const summaryStartTime = Date.now();
-        const summaryAns = await callGPT(TAROT_SUMMARY_MESSAGES(cards || '', concern || ''), requestId);
-        const summaryDuration = Date.now() - summaryStartTime;
-        
-        logger.info('Tarot summary completed', { 
-          requestId, 
-          userId,
-          duration: summaryDuration,
-          responseLength: summaryAns.length 
-        });
-
-        // まとめを送信
-        await replyText(replyToken, summaryAns);
-        
-        // 少し間を置いてフォローアップメッセージを送信
-        setTimeout(async () => {
-          await pushMessage(userId, FOLLOWUP_MSG);
-        }, 2000);
+        // フォローアップメッセージを送信
+        await replyText(replyToken, FOLLOWUP_MSG);
         
         // 最終更新（extra_credits: 0, session_closed: true）
         const { error: updateError } = await supabase
           .from('diagnosis_logs')
           .update({
-            tarot_summary: summaryAns,
             extra_credits: 0,
             session_closed: true,
             updated_at: new Date().toISOString()
@@ -459,8 +413,8 @@ app.post('/webhook', async (req, res) => {
           .eq('line_user_id', userId);
 
         if (updateError) {
-          logger.error('Summary update error', { requestId, error: updateError });
-          await notifyError(updateError, { requestId, userId, operation: 'summaryUpdate' });
+          logger.error('Final update error', { requestId, error: updateError });
+          await notifyError(updateError, { requestId, userId, operation: 'finalUpdate' });
         }
         continue;
       }
@@ -814,20 +768,7 @@ async function pushMessage(userId, text) {
   }
 }
 
-// 🆕 タロットカード情報抽出
-function extractTarotCards(tarotResult) {
-  // カード名を抽出する簡易的な実装
-  // 実際の出力形式に応じて調整が必要
-  const cardPattern = /🔹(過去|現在|未来)：(.+?)（.+?\/.+?）\s*-\s*(正位置|逆位置)/g;
-  const matches = [...tarotResult.matchAll(cardPattern)];
-  
-  return matches.map(match => ({
-    position: match[1],
-    nameJa: match[2],
-    nameEn: match[3],
-    orientation: match[4]
-  })).map(card => `${card.position}:${card.nameJa}`).join(', ');
-}
+// 削除：extractTarotCardsも不要になったため
 
 // ⓭ 起動
 app.listen(PORT, () => {
