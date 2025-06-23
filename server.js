@@ -507,6 +507,7 @@ app.post('/webhook', async (req, res) => {
             self_analysis_result: analysisReport,
             extra_credits: 1,
             session_closed: false,
+            input_error_count: 0, // エラーカウントをリセット
             updated_at: new Date().toISOString()
           })
           .eq('line_user_id', userId);
@@ -516,9 +517,44 @@ app.post('/webhook', async (req, res) => {
           await notifyError(updateError, { requestId, userId, operation: 'analysisUpdate' });
         }
       } else if (extraCredits === 2 && !hasAllInput && text !== '診断開始') {
-        // 「診断開始」以外のメッセージで、まだ情報が揃っていない場合
-        logger.info('Incomplete user data - ignoring message', { requestId, userId });
-        // 何も返信しない（LINEの自動応答に任せる）
+        // 入力フォーマットをチェック
+        const hasNumberFormat = /①|②|③|④|⑤/.test(text);
+        const currentErrorCount = userState.input_error_count || 0;
+        
+        // ①〜⑤の形式で入力されているが、必須項目が不足している場合
+        if (hasNumberFormat && currentErrorCount < 2) {
+          const missingFields = [];
+          if (!data.name) missingFields.push('お名前');
+          if (!data.birthdate) missingFields.push('生年月日');
+          if (!data.gender) missingFields.push('性別');
+          
+          logger.info('Incomplete form submission detected', { 
+            requestId, 
+            userId,
+            missingFields,
+            errorCount: currentErrorCount + 1
+          });
+          
+          // エラーカウントを更新
+          await supabase
+            .from('diagnosis_logs')
+            .update({
+              input_error_count: currentErrorCount + 1,
+              updated_at: new Date().toISOString()
+            })
+            .eq('line_user_id', userId);
+          
+          await replyText(
+            replyToken, 
+            `入力内容を確認させていただきました✨\n\n以下の項目が見つかりませんでした：\n${missingFields.map(f => `・${f}`).join('\n')}\n\nお手数ですが、もう一度すべての項目をご記入いただけますか？\n\n例）\n①田中花子\n②1990/01/01\n③14時30分\n④INFP\n⑤女性`
+          );
+        } else if (hasNumberFormat && currentErrorCount >= 2) {
+          // 2回以上エラーの場合は反応しない
+          logger.info('Max error count reached - ignoring message', { requestId, userId });
+        } else {
+          // ①〜⑤の形式でない場合は何も返信しない
+          logger.info('Non-form message ignored', { requestId, userId });
+        }
       } else {
         logger.info('No action taken', { 
           requestId, 
@@ -560,17 +596,33 @@ app.post('/webhook', async (req, res) => {
 // ⓬ ヘルパー関数
 function extractUserData(text) {
   const rx = {
-    name: /①.*?：(.*?)(?=\n|$)/s,
-    birthdate: /②.*?：(.*?)(?=\n|$)/s,
-    birthtime: /③.*?：(.*?)(?=\n|$)/s,
-    mbti: /④.*?：(.*?)(?=\n|$)/s,
-    gender: /⑤.*?：(.*?)(?=\n|$)/s,
+    // ：がある場合とない場合の両方に対応
+    name: /①.*?[:：]?\s*(.*?)(?=\n|$)/s,
+    birthdate: /②.*?[:：]?\s*(.*?)(?=\n|$)/s,
+    birthtime: /③.*?[:：]?\s*(.*?)(?=\n|$)/s,
+    mbti: /④.*?[:：]?\s*(.*?)(?=\n|$)/s,
+    gender: /⑤.*?[:：]?\s*(.*?)(?=\n|$)/s,
   };
   const obj = {};
   for (const [k, r] of Object.entries(rx)) {
     const m = text.match(r);
-    obj[k] = m ? m[1].trim() : null;
+    if (m) {
+      // ①、②などの番号自体が抽出されないように処理
+      let value = m[1].trim();
+      // 「お名前」などのラベルテキストを除去
+      value = value.replace(/^(お名前|生年月日.*?|生まれた時間.*?|MBTI.*?|性別.*?)[:：]?\s*/i, '');
+      obj[k] = value || null;
+    } else {
+      obj[k] = null;
+    }
   }
+  
+  // デバッグ用ログ
+  logger.debug('Extracted user data', { 
+    input: text.substring(0, 100) + '...', 
+    extracted: obj 
+  });
+  
   return obj;
 }
 
