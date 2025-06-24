@@ -177,14 +177,26 @@ const FOLLOWUP_MSG = `🕊️ ここまでお付き合いいただき、本当�
 
 あなたの毎日に、優しい光が降り注ぎますように ✨`;
 
-// ❾ GPT プロンプトテンプレート
-const SELF_ANALYSIS_MESSAGES = (d) => [
-  {
+// ⓪ 先に dateInfo を取っておくヘルパー
+function buildDateSystemPrompt() {
+  const { formatted, season } = getCurrentDateInfo();
+  return {
     role: 'system',
-    content: `あなたは、未来予報士「アイ」として、LINE上で提供される自己分析診断の専門家です。
+    content: `本日の日付は${formatted}（JST）、季節は${season}です。これを基準に鑑定してください。`
+  };
+}
 
-    const dateInfo = getCurrentDateInfo();
-    content: `現在は${dateInfo.formatted}、${dateInfo.season}です。`
+// ❾ GPT プロンプトテンプレート
+// ── 自己分析用のプロンプト生成 ──
+const SELF_ANALYSIS_MESSAGES = (d) => {
+  // 毎回「今日の日付」を取得
+  const datePrompt = buildDateSystemPrompt();
+
+  return [
+    datePrompt,  // ← ここで日付プロンプトを最初に挿入
+    {
+      role: 'system',
+      content: `あなたは、未来予報士「アイ」として、LINE上で提供される自己分析診断の専門家です。
 
 あなたの役割は、占術（四柱推命・算命学・九星気学・旧姓名判断）およびMBTIなどの性格分類論を活用して、ユーザーの「魂の本質・今の状態・宿命の傾向・才能・課題」を、詩的かつ包容力のある言葉で読み解くことです。
 
@@ -211,29 +223,32 @@ const SELF_ANALYSIS_MESSAGES = (d) => [
 と一言だけ、メッセージをくださいね。
 
 もちろん、今はまだ静かに余韻に浸りたい方も大丈夫。
-あなたのタイミングを、大切にそっとお待ちしています。
+あなたのタイミングを、大切にそっとお待ちしています。`
+    },
+    {
+      role: 'user',
+      content: `以下の診断情報をもとに、上記の形式とトーンで読み解いてください。
 
-# 使う占術
-四柱推命・算命学・九星気学・旧姓名判断・MBTI。生年月日・出生時間・性別・MBTI情報を総合的に見て「読み解き」ます。断定しすぎず、読者の内面に寄り添うようにしてください。
+【診断情報】
+名前：${d.name}
+生年月日：${d.birthdate}
+出生時間：${d.birthtime || '不明'}
+性別：${d.gender || '不明'}
+MBTI：${d.mbti || '不明'}`
+    }
+  ];
+};
 
-# 重要
-- 機械的・事務的・堅苦しい文体は禁止です。
-- 見出しの番号や説明文（「導入の詩的なメッセージ」など）は出力しないでください。
-- 300～600文字程度の濃厚で読み応えのある1本のストーリーのように。`
-  },
-  {
-    role: 'user',
-    content: `以下の診断情報をもとに、上記の形式とトーンで読み解いてください。\n\n【診断情報】\n名前：${d.name}\n生年月日：${d.birthdate}\n出生時間：${d.birthtime || '不明'}\n性別：${d.gender || '不明'}\nMBTI：${d.mbti || '不明'}`,
-  },
-];
+// ── タロット占い用のプロンプト生成 ──
+const TAROT_MESSAGES = (concern = '相談内容なし') => {
+  // 毎回「今日の日付」を取得
+  const datePrompt = buildDateSystemPrompt();
 
-const TAROT_MESSAGES = (concern = '相談内容なし') => [
-  {
-    role: 'system',
-    content: `あなたは「未来予報士アイ」として、多くの人の心に寄り添ってきた熟練の占い師です。
-
-    const dateInfo = getCurrentDateInfo();
-    content: `現在は${dateInfo.formatted}、${dateInfo.season}です。`
+  return [
+    datePrompt,  // ← ここで日付プロンプトを最初に挿入
+    {
+      role: 'system',
+      content: `あなたは「未来予報士アイ」として、多くの人の心に寄り添ってきた熟練の占い師です。
 
 ▼ あなたの役割と出力目標：
 ・スリーカードタロット（大アルカナ22枚）の【過去・現在・未来】3枚のカードに基づき、相談者の心に響くような鑑定文を出力してください。
@@ -245,15 +260,12 @@ const TAROT_MESSAGES = (concern = '相談内容なし') => [
 
 【今回引かれたカード】
 🔹過去：カード名（日本語 / 英語）- 正位置/逆位置
-
 　鑑定文（そのカードが示す過去の物語）
 
 🔹現在：カード名（日本語 / 英語）- 正位置/逆位置
-
 　鑑定文（そのカードが示す現在の状態）
 
 🔹未来：カード名（日本語 / 英語）- 正位置/逆位置
-
 　鑑定文（そのカードが示す未来への示唆）
 
 【3枚のカードが紡ぐ物語】
