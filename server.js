@@ -564,14 +564,13 @@ if (text === '特別なご案内' && extraCredits === 0.3) {
         // プレミアムな演出を追加した診断結果
         const diagnosisNumber = generateDiagnosisNumber();
         const timeGreeting = getTimeBasedGreeting();
-        const premiumReport = `━━━━━━━━━━━━━━━
+        const premiumReport = `━━━━━━━━━━━━
 診断番号: ${diagnosisNumber}
 
-${timeGreeting}
 ${data.name}さまのために
 心を込めて紡いだ
 特別な診断結果をお届けします。
-━━━━━━━━━━━━━━━
+━━━━━━━━━━━━
 
 ${analysisReport}`;
 
