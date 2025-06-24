@@ -291,8 +291,9 @@ const TAROT_MESSAGES = (concern = '相談内容なし') => {
   {
     role: 'user',
     content: `相談内容：${concern}`,
-  },
+  }
 ];
+};
 
 // 削除：TAROT_SUMMARY_MESSAGESは不要になったため
 
