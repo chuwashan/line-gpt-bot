@@ -157,7 +157,7 @@ const FOLLOWUP_MSG = `🕊️ ここまでお付き合いいただき、本当�
 心に残ったフレーズや、気づいたことがあれば
 ぜひ聞かせてくださいね。
 
-───────────────
+────────────
 
 もっと深く自分を知りたくなったとき
 誰かに話を聞いてほしくなったときは
@@ -239,12 +239,15 @@ const TAROT_MESSAGES = (concern = '相談内容なし') => [
 
 【今回引かれたカード】
 🔹過去：カード名（日本語 / 英語）- 正位置/逆位置
+
 　鑑定文（そのカードが示す過去の物語）
 
 🔹現在：カード名（日本語 / 英語）- 正位置/逆位置
+
 　鑑定文（そのカードが示す現在の状態）
 
 🔹未来：カード名（日本語 / 英語）- 正位置/逆位置
+
 　鑑定文（そのカードが示す未来への示唆）
 
 【3枚のカードが紡ぐ物語】
@@ -554,13 +557,11 @@ if (text === '特別なご案内' && extraCredits === 0.3) {
         // プレミアムな演出を追加した診断結果
         const diagnosisNumber = generateDiagnosisNumber();
         const timeGreeting = getTimeBasedGreeting();
-        const premiumReport = `━━━━━━━━━━━━
-診断番号: ${diagnosisNumber}
+        const premiumReport = `${diagnosisNumber}
 
 ${data.name}さまのために
 心を込めて紡いだ
 特別な診断結果をお届けします。
-━━━━━━━━━━━━
 
 ${analysisReport}`;
 
