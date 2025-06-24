@@ -449,15 +449,8 @@ ${tarotAns}`;
 if (text === '特別なご案内' && extraCredits === 0.3) {
   logger.info('Showing special announcement', { requestId, userId });
   
-  // DBから保存済みの開運アドバイスを使用
-  const luckyAdvice = userState.lucky_advice || generateLuckyAdvice(userState.name || 'あなた');
-  
-  // 開運アドバイスを送信
-  await replyText(replyToken, luckyAdvice);
-  
-  // 3秒後にフォローアップメッセージ
-  setTimeout(async () => {
-    await pushMessage(userId, FOLLOWUP_MSG);
+  // フォローアップメッセージ
+  await replyText(replyToken, FOLLOWUP_MSG);
     
     // さらに3秒後にシェアボタンを表示
     setTimeout(async () => {
