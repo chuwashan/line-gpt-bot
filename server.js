@@ -260,11 +260,15 @@ const TAROT_MESSAGES = (concern = '相談内容なし') => [
 
 この3枚のカードを通して伝えたいメッセージ...（全体を通しての深い洞察と、相談内容「${concern}」への具体的なエール）
 
+【開運アドバイス】
+
+🌙 ラッキーカラー：（3枚のカードのエネルギーと相談内容から導かれる色とその理由）
+🌙 ラッキーアイテム：（カードが示すシンボルや相談内容に関連するアイテムとその意味）
+🌙 開運アクション：（カードのメッセージと相談内容を踏まえた具体的で実践可能な行動）
+
 # 重要
-- あなた自身で22枚の大アルカナからランダムに3枚を（過去・現在・未来の順）引き、正位置か逆位置もランダムに決定してください。
-- カードを引いたあと、必ず上記の構成で出力してください。
-- 個別のカード解説と、3枚の総合的な物語の両方を一度に出力してください。
-- 「静かな導入文」などの説明は書かず、自然な文章として出力してください。`
+- 開運アドバイスは必ず相談内容とカードの意味を組み合わせて、その人だけの特別なものにしてください。
+- 「なぜその色/アイテム/アクションなのか」がカードから読み取れるようにしてください。`
   },
   {
     role: 'user',
@@ -427,14 +431,15 @@ ${tarotAns}`;
         
         // タロット結果を保存
         const { error: updateError } = await supabase
-          .from('diagnosis_logs')
-          .update({
-            tarot_concern: text,
-            tarot_result: tarotAns,
-            extra_credits: 0.3, // 特別案内待機状態
-            updated_at: new Date().toISOString()
-          })
-          .eq('line_user_id', userId);
+  .from('diagnosis_logs')
+  .update({
+    tarot_concern: text,
+    tarot_result: tarotAns,
+    lucky_advice: extractLuckyAdvice(tarotAns, userState.name || 'あなた'), // 追加
+    extra_credits: 0.3,
+    updated_at: new Date().toISOString()
+  })
+  .eq('line_user_id', userId);
 
         if (updateError) {
           logger.error('Tarot update error', { requestId, error: updateError });
@@ -443,65 +448,73 @@ ${tarotAns}`;
         continue;
       }
 
-      // 💝 特別なご案内表示（extra_credits: 0.3の時）
-      if (text === '特別なご案内' && extraCredits === 0.3) {
-        logger.info('Showing special announcement', { requestId, userId });
-        
-        // フォローアップメッセージを送信
-        await replyText(replyToken, FOLLOWUP_MSG);
-        
-        // 少し遅れてシェアボタンを表示
-        setTimeout(async () => {
-          const shareMessage = `無料の心理診断見つけた！\nhttps://lin.ee/aQZAOEo`;
-          
-          await pushMessageWithQuickReply(
-            userId,
-            '✨ もしよろしければ、お友達にも教えてあげてくださいね',
-            [
-              {
-                type: 'action',
-                action: {
-                  type: 'uri',
-                  label: '📱 LINEで共有',
-                  uri: `https://line.me/R/msg/text/?${encodeURIComponent(shareMessage)}`
-                }
-              },
-              {
-                type: 'action',
-                action: {
-                  type: 'uri',
-                  label: '🐦 Xで共有',
-                  uri: `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareMessage)}`
-                }
-              },
-              {
-                type: 'action',
-                action: {
-                  type: 'clipboard',
-                  label: '📷 Instagramにコピー',
-                  clipboardText: shareMessage
-                }
-              }
-            ]
-          );
-        }, 3000); // 3秒後
-        
-        // 最終更新（extra_credits: 0, session_closed: true）
-        const { error: updateError } = await supabase
-          .from('diagnosis_logs')
-          .update({
-            extra_credits: 0,
-            session_closed: true,
-            updated_at: new Date().toISOString()
-          })
-          .eq('line_user_id', userId);
+// 💝 特別なご案内表示（extra_credits: 0.3の時）
+if (text === '特別なご案内' && extraCredits === 0.3) {
+  logger.info('Showing special announcement', { requestId, userId });
+  
+  // DBから保存済みの開運アドバイスを使用
+  const luckyAdvice = userState.lucky_advice || generateLuckyAdvice(userState.name || 'あなた');
+  
+  // 開運アドバイスを送信
+  await replyText(replyToken, luckyAdvice);
+  
+  // 3秒後にフォローアップメッセージ
+  setTimeout(async () => {
+    await pushMessage(userId, FOLLOWUP_MSG);
+    
+    // さらに3秒後にシェアボタンを表示
+    setTimeout(async () => {
+      const shareMessage = `無料の心理診断見つけた！\nhttps://lin.ee/aQZAOEo`;
+      
+      await pushMessageWithQuickReply(
+        userId,
+        '✨ もしよろしければ、お友達にも教えてあげてくださいね',
+        [
+          {
+            type: 'action',
+            action: {
+              type: 'uri',
+              label: '📱 LINEで共有',
+              uri: `https://line.me/R/msg/text/?${encodeURIComponent(shareMessage)}`
+            }
+          },
+          {
+            type: 'action',
+            action: {
+              type: 'uri',
+              label: '🐦 Xで共有',
+              uri: `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareMessage)}`
+            }
+          },
+          {
+            type: 'action',
+            action: {
+              type: 'clipboard',
+              label: '📷 Instagramにコピー',
+              clipboardText: shareMessage
+            }
+          }
+        ]
+      );
+    }, 3000); // さらに3秒後
+  }, 3000); // 3秒後
+  
+  // 最終更新（extra_credits: 0, session_closed: true）
+  const { error: updateError } = await supabase
+    .from('diagnosis_logs')
+    .update({
+      extra_credits: 0,
+      session_closed: true,
+      updated_at: new Date().toISOString()
+    })
+    .eq('line_user_id', userId);
 
-        if (updateError) {
-          logger.error('Final update error', { requestId, error: updateError });
-          await notifyError(updateError, { requestId, userId, operation: 'finalUpdate' });
-        }
-        continue;
-      }
+  if (updateError) {
+    logger.error('Final update error', { requestId, error: updateError });
+    await notifyError(updateError, { requestId, userId, operation: 'finalUpdate' });
+  }
+  continue;
+}
 
       // 🧠 自己分析フロー
       const data = extractUserData(text);
@@ -738,6 +751,31 @@ function getTimeBasedGreeting() {
   } else {
     return 'こんばんは。\n静かな夜の時間に';
   }
+}
+
+// 🆕 タロット結果から開運アドバイスを抽出
+function extractLuckyAdvice(tarotResult, userName) {
+  // 開運アドバイス部分を抽出
+  const adviceMatch = tarotResult.match(/【開運アドバイス】([\s\S]*?)$/);
+  
+  if (adviceMatch && adviceMatch[1]) {
+    return `━━━━━━━━━━━━━━━
+✨ 今月の開運アドバイス ✨
+
+${userName}さまへ
+カードが示す特別なメッセージです
+
+${adviceMatch[1].trim()}
+
+このアドバイスは、あなたの相談内容と
+引かれたカードから導き出された
+世界でひとつだけのメッセージです
+━━━━━━━━━━━━━━━`;
+  }
+  
+  // 抽出できない場合は既存の関数を使用
+  logger.warn('Failed to extract lucky advice from tarot result');
+  return generateLuckyAdvice(userName);
 }
 
 // 🆕 ユーザー状態取得/作成関数
