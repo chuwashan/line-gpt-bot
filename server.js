@@ -490,7 +490,6 @@ if (text === '特別なご案内' && extraCredits === 0.3) {
         ]
       );
     }, 3000); // さらに3秒後
-  }, 3000); // 3秒後
   
   // 最終更新（extra_credits: 0, session_closed: true）
   const { error: updateError } = await supabase
