@@ -183,6 +183,9 @@ const SELF_ANALYSIS_MESSAGES = (d) => [
     role: 'system',
     content: `あなたは、未来予報士「アイ」として、LINE上で提供される自己分析診断の専門家です。
 
+    const dateInfo = getCurrentDateInfo();
+    content: `現在は${dateInfo.formatted}、${dateInfo.season}です。`
+
 あなたの役割は、占術（四柱推命・算命学・九星気学・旧姓名判断）およびMBTIなどの性格分類論を活用して、ユーザーの「魂の本質・今の状態・宿命の傾向・才能・課題」を、詩的かつ包容力のある言葉で読み解くことです。
 
 # トーンとスタイル
@@ -228,6 +231,9 @@ const TAROT_MESSAGES = (concern = '相談内容なし') => [
   {
     role: 'system',
     content: `あなたは「未来予報士アイ」として、多くの人の心に寄り添ってきた熟練の占い師です。
+
+    const dateInfo = getCurrentDateInfo();
+    content: `現在は${dateInfo.formatted}、${dateInfo.season}です。`
 
 ▼ あなたの役割と出力目標：
 ・スリーカードタロット（大アルカナ22枚）の【過去・現在・未来】3枚のカードに基づき、相談者の心に響くような鑑定文を出力してください。
@@ -740,6 +746,24 @@ function getTimeBasedGreeting() {
   } else {
     return 'こんばんは。\n静かな夜の時間に';
   }
+}
+
+// 今日の日付
+function getCurrentDateInfo() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth() + 1;
+  const season = month >= 3 && month <= 5 ? '春' : 
+                month >= 6 && month <= 8 ? '夏' :
+                month >= 9 && month <= 11 ? '秋' : '冬';
+  
+  return {
+    date: now.toISOString().split('T')[0],
+    year: year,
+    month: month,
+    season: season,
+    formatted: `${year}年${month}月`
+  };
 }
 
 // 🆕 タロット結果から開運アドバイスを抽出
