@@ -459,44 +459,40 @@ ${tarotAns}`;
 if (text === '特別なご案内' && extraCredits === 0.3) {
   logger.info('Showing special announcement', { requestId, userId });
   
-  // フォローアップメッセージ
-  await replyText(replyToken, FOLLOWUP_MSG);
-    
-    // さらに3秒後にシェアボタンを表示
-    setTimeout(async () => {
-      const shareMessage = `無料の心理診断見つけた！\nhttps://lin.ee/aQZAOEo`;
-      
-      await pushMessageWithQuickReply(
-        userId,
-        '✨ もしよろしければ、お友達にも教えてあげてくださいね',
-        [
-          {
-            type: 'action',
-            action: {
-              type: 'uri',
-              label: '📱 LINEで共有',
-              uri: `https://line.me/R/msg/text/?${encodeURIComponent(shareMessage)}`
-            }
-          },
-          {
-            type: 'action',
-            action: {
-              type: 'uri',
-              label: '🐦 Xで共有',
-              uri: `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareMessage)}`
-            }
-          },
-          {
-            type: 'action',
-            action: {
-              type: 'clipboard',
-              label: '📷 Instagramにコピー',
-              clipboardText: shareMessage
-            }
-          }
-        ]
-      );
-    }, 3000); // さらに3秒後
+  // シェアメッセージ
+  const shareMessage = `無料の心理診断見つけた！\nhttps://lin.ee/aQZAOEo`;
+  
+  // すべてを1つのメッセージに統合して返信
+  await replyWithQuickReply(
+    replyToken,
+    `${FOLLOWUP_MSG}\n\n✨ もしよろしければ、お友達にも教えてあげてくださいね`,
+    [
+      {
+        type: 'action',
+        action: {
+          type: 'uri',
+          label: '📱 LINEで共有',
+          uri: `https://line.me/R/msg/text/?${encodeURIComponent(shareMessage)}`
+        }
+      },
+      {
+        type: 'action',
+        action: {
+          type: 'uri',
+          label: '🐦 Xで共有',
+          uri: `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareMessage)}`
+        }
+      },
+      {
+        type: 'action',
+        action: {
+          type: 'clipboard',
+          label: '📷 Instagramにコピー',
+          clipboardText: shareMessage
+        }
+      }
+    ]
+  );
   
   // 最終更新（extra_credits: 0, session_closed: true）
   const { error: updateError } = await supabase
