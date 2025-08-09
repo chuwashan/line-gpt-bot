@@ -1,17 +1,16 @@
 /*
- * server.js — LINE × Supabase × GPT  (セキュリティ・監視強化版 + ユーザー管理改善)
- * ----------------------------------------------------------------------
- * 追加機能
- * ✔ LINE署名検証でなりすまし防止
- * ✔ 構造化ログによる詳細な動作記録
- * ✔ エラー監視とアラート機能
- * ✔ レート制限による不正利用防止
- * ✔ セキュリティヘッダーとヘルスチェック
- * ✔ ユーザーごとの状態管理（重複レコード防止）
- * ----------------------------------------------------------------------
+ * server.js — LINE × Supabase × GPT（堅牢版 / 2025-08）
+ * 変更点（要約）
+ * - ✅ モデル名をENV化（OPENAI_MODEL / *_SELF / *_TAROT）
+ * - ✅ JSTの時刻取得をIntlで安全に
+ * - ✅ イベント冪等化（重複再送の二重処理防止）
+ * - ✅ Supabaseの条件付き更新（期待状態を満たす時だけ更新）
+ * - ✅ QuickReplyの互換（clipboard排除） & 送信リトライ
+ * - ✅ OpenAI/LINEとも指数バックオフ＋jitter
+ * - ✅ 依存疎通込みの /health
+ * - ✅ ステートを列挙型で明示（マジックナンバー撤廃）
  */
 
-// ❶ 依存モジュール & 環境変数
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
@@ -20,15 +19,21 @@ const { createClient } = require('@supabase/supabase-js');
 const winston = require('winston');
 require('dotenv').config();
 
-const PORT   = process.env.PORT || 3000;
+// ====== ENV ======
+const PORT = process.env.PORT || 3000;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET; // 🔒 署名検証用
-const GPT_API_KEY  = process.env.OPENAI_API_KEY;
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+const GPT_API_KEY = process.env.OPENAI_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL; // 🚨 アラート用（任意）
+const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL || null;
 
-// ❷ ログ設定
+// モデル切替（用途別に上書き可）
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5-mini';
+const OPENAI_MODEL_SELF = process.env.OPENAI_MODEL_SELF || OPENAI_MODEL;
+const OPENAI_MODEL_TAROT = process.env.OPENAI_MODEL_TAROT || OPENAI_MODEL;
+
+// ====== ロガー ======
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
   format: winston.format.combine(
@@ -39,21 +44,18 @@ const logger = winston.createLogger({
   defaultMeta: { service: 'line-ai-bot' },
   transports: [
     new winston.transports.Console({
-      format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.simple()
-      )
+      format: winston.format.combine(winston.format.colorize(), winston.format.simple())
     })
   ]
 });
 
-// ❃ Supabase クライアント
+// ====== Supabase ======
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
-// ❹ Express 初期化とセキュリティ設定
+// ====== Express ======
 const app = express();
 
-// 🔒 セキュリティヘッダー
+// セキュリティヘッダ
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
@@ -61,628 +63,360 @@ app.use((req, res, next) => {
   next();
 });
 
-// Raw bodyが必要（署名検証のため）
+// LINE署名検証用に /webhook は raw body、他は通常JSON
 app.use('/webhook', bodyParser.raw({ type: 'application/json' }));
 app.use(bodyParser.json());
 
-// ❺ レート制限（メモリ内実装）
+// ====== レート制限（簡易 / 単一インスタンス） ======
 const rateLimit = new Map();
-const RATE_LIMIT_WINDOW = 60000; // 1分
-const RATE_LIMIT_MAX = 10; // 1分間に10回まで
-
+const RATE_LIMIT_WINDOW = 60_000;
+const RATE_LIMIT_MAX = 10;
 function checkRateLimit(userId) {
   const now = Date.now();
-  const userRequests = rateLimit.get(userId) || [];
-  const recentRequests = userRequests.filter(time => now - time < RATE_LIMIT_WINDOW);
-  
-  if (recentRequests.length >= RATE_LIMIT_MAX) {
-    logger.warn('Rate limit exceeded', { userId, requestCount: recentRequests.length });
-    return false;
-  }
-  
-  recentRequests.push(now);
-  rateLimit.set(userId, recentRequests);
+  const arr = (rateLimit.get(userId) || []).filter(t => now - t < RATE_LIMIT_WINDOW);
+  if (arr.length >= RATE_LIMIT_MAX) return false;
+  arr.push(now);
+  rateLimit.set(userId, arr);
   return true;
 }
 
-// ❻ LINE署名検証
-function verifyLineSignature(body, signature) {
-  if (!LINE_CHANNEL_SECRET) {
-    logger.error('LINE_CHANNEL_SECRET not configured');
-    return false;
-  }
-  
-  const hash = crypto
-    .createHmac('sha256', LINE_CHANNEL_SECRET)
-    .update(body)
-    .digest('base64');
-  
-  const isValid = hash === signature;
-  
-  if (!isValid) {
-    logger.warn('Invalid LINE signature', { 
-      expected: hash.substring(0, 10) + '...', 
-      received: signature?.substring(0, 10) + '...' 
-    });
-  }
-  
-  return isValid;
+// ====== イベント冪等化（重複処理防止） ======
+const processedEvents = new Map(); // 本番はRedis推奨
+const EVI_TTL_MS = 10 * 60 * 1000;
+function isDuplicateEvent(key) {
+  const now = Date.now();
+  for (const [k, ts] of processedEvents) if (now - ts > EVI_TTL_MS) processedEvents.delete(k);
+  if (processedEvents.has(key)) return true;
+  processedEvents.set(key, now);
+  return false;
 }
 
-// ❼ エラー通知機能
+// ====== ステート定数 ======
+const ST = {
+  NEED_INPUT: 2,
+  AFTER_SELF: 1,
+  TAROT_WAIT: 0.5,
+  OFFER_SHOWN: 0.3,
+  CLOSED: 0
+};
+
+// ====== 署名検証 ======
+function verifyLineSignature(rawBody, signature) {
+  if (!LINE_CHANNEL_SECRET) return false;
+  const hash = crypto.createHmac('sha256', LINE_CHANNEL_SECRET).update(rawBody).digest('base64');
+  return hash === signature;
+}
+
+// ====== エラー通知（Slack任意） ======
 async function notifyError(error, context = {}) {
-  const errorInfo = {
-    timestamp: new Date().toISOString(),
-    error: error.message,
-    stack: error.stack,
-    context
-  };
-  
-  logger.error('Critical error occurred', errorInfo);
-  
-  // Slack通知（設定されている場合）
-  if (SLACK_WEBHOOK_URL) {
-    try {
-      await axios.post(SLACK_WEBHOOK_URL, {
-        text: `🚨 LINE Bot Error Alert`,
-        attachments: [{
-          color: 'danger',
-          fields: [
-            { title: 'Error', value: error.message, short: false },
-            { title: 'Context', value: JSON.stringify(context, null, 2), short: false }
-          ]
-        }]
-      });
-    } catch (slackError) {
-      logger.error('Failed to send Slack notification', { error: slackError.message });
-    }
+  logger.error('Critical error', { err: error.message, ctx: context, stack: error.stack });
+  if (!SLACK_WEBHOOK_URL) return;
+  try {
+    await axios.post(SLACK_WEBHOOK_URL, {
+      text: '🚨 LINE Bot Error',
+      attachments: [{ color: 'danger', fields: [
+        { title: 'Error', value: error.message, short: false },
+        { title: 'Context', value: '```' + JSON.stringify(context).slice(0, 2000) + '```', short: false }
+      ]}]
+    });
+  } catch (e) {
+    logger.error('Slack notify failed', { err: e.message });
   }
 }
 
-// ❽ 固定メッセージ
+// ====== 定型文 ======
 const TEMPLATE_MSG = `① お名前：
 ② 生年月日（西暦）：
 ③ 生まれた時間（不明でもOK）：
-④ MBTI（わからなければ空欄でOK）：
+④ MBTI（空欄OK）：
 ⑤ 性別（男性・女性・その他・不明）：
 
-上記5つをコピーしてご記入のうえ送ってくださいね🕊️`;
+上記5つをコピーしてご記入ください🕊️`;
 
 const FOLLOWUP_MSG = `ここまでお付き合いいただき
 ありがとうございました🕊️
 
-もし私からのメッセージが
-あなたの心にほんの少しでも灯をともすものであったなら
-とても嬉しく思います。
-
-心に残ったフレーズや、気づいたことがあればぜひ聞かせてくださいね。
+もし心に灯がともる言葉があれば、とても嬉しく思います。
+気づきや感想があればぜひ教えてくださいね。
 
 ────────────
 
-もっと深く自分を知りたくなったとき、さらに話を聞いてほしくなったときは、いつでも私にご相談ください。
+もっと深く自分を知りたくなったときは、いつでもご相談ください。
 
-💫 ココナラでは初回500円〜ご相談いただけます
+💫 ココナラ（初回500円〜）
 ▶︎ https://coconala.com/invite/CR0VNB
-（新規登録で1,000円分のポイントプレゼント中）
 
 🌙 公式LINEでは
 ・無料タロット診断
-・ココナラ限定クーポン
+・クーポン
 ・心が軽くなるメッセージ
-
-などを不定期でお届けします。
-ぜひこのまま、ゆるやかにつながっていてくださいね。
+を不定期でお届けします。
 
 あなたの毎日に優しい光が降り注ぎますように ✨
-
 未来予報士ユメノアイ`;
 
-// ⓪ 先に dateInfo を取っておくヘルパー
+// ====== 日付/時刻ユーティリティ ======
+function getTimeBasedGreeting() {
+  const hour = Number(new Intl.DateTimeFormat('ja-JP', {
+    hour: '2-digit', hour12: false, timeZone: 'Asia/Tokyo'
+  }).format(new Date()));
+  if (hour < 10) return 'おはようございます。\n朝の澄んだ空気の中で';
+  if (hour < 17) return 'こんにちは。\n穏やかな時間の中で';
+  if (hour < 21) return 'こんばんは。\n夕暮れの静寂の中で';
+  return 'こんばんは。\n静かな夜の時間に';
+}
+function getCurrentDateInfo() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth() + 1;
+  const season = m>=3&&m<=5?'春':m>=6&&m<=8?'夏':m>=9&&m<=11?'秋':'冬';
+  return { formatted: `${y}年${m}月`, season };
+}
 function buildDateSystemPrompt() {
   const { formatted, season } = getCurrentDateInfo();
-  return {
-    role: 'system',
-    content: `本日の日付は${formatted}（JST）、季節は${season}です。これを基準に鑑定してください。`
-  };
+  return { role: 'system', content: `本日の日付は${formatted}（JST）、季節は${season}です。これを基準に鑑定してください。` };
 }
 
-const SELF_ANALYSIS_MESSAGES = (d) => {
-  const datePrompt = buildDateSystemPrompt();
-
-  return [
-    datePrompt,
-    {
-      role: 'system',
-      content: `あなたは、未来予報士「アイ」として、四柱推命・算命学・九星気学・旧姓名判断・MBTI を総合的に使い、深層分析を行います。
-
-# 出力構成（必ずこの形式で）
-
+// ====== プロンプト ======
+const SELF_ANALYSIS_MESSAGES = (d) => ([
+  buildDateSystemPrompt(),
+  {
+    role: 'system',
+    content:
+`あなたは未来予報士「アイ」。四柱推命・算命学・九星気学・姓名の響き・MBTIを総合し深層分析します。
+# 出力構成
 🔹 あなたの真の性格
-（生年月日と生まれ時間から読み取れる、変わることのない本質を1-2文で。具体的なエピソードを交えて）
-
-🔹 宿る星と運命の流れ  
-（現在の運気の流れと、今年〜来年にかけての大きな流れを1-2文で。希望を持てる内容に）
-
+🔹 宿る星と運命の流れ
 🔹 天賦の才能
-（名前の響きやMBTIも参考に、まだ開花していない可能性を1-2文で。具体的な分野を示唆）
-
 🔹 気をつけるべきこと
-（バランスを整えるためのアドバイスを1-2文で。否定的にならず改善案として）
-
 🔹 あなただけの開運の鍵
-（総合的に見て、この人が幸せになるための具体的な行動を1-2文で）
-
-じつは… ${d.name}さんのためだけに、特別なタロット占いもご用意しています。
-
-もし受け取ってみようと思ったときは、
-
-【特別プレゼント】
-
-と一言だけ、メッセージをくださいね。
-
-# 重要
-- 占術名は出さないが、深い分析に基づいた説得力のある内容に
-- 各項目は関連性を持たせ、一つの物語として読めるように
-- ポジティブな表現を心がけ、読後感が明るくなるように`
-    },
-    {
-      role: 'user',
-      content: `以下の診断情報をもとに、上記の形式とトーンで読み解いてください。
-
-【診断情報】
+- 占術名は出さず、整合的で物語性のある文体
+- 各項目は1-2文、読後感が明るくなる表現
+- ${d.name}さん専用の内容に`
+  },
+  {
+    role: 'user',
+    content:
+`【診断情報】
 名前：${d.name}
 生年月日：${d.birthdate}
 出生時間：${d.birthtime || '不明'}
 性別：${d.gender || '不明'}
 MBTI：${d.mbti || '不明'}`
-    }
-  ];
-};
+  }
+]);
 
-// ── タロット占い用のプロンプト生成 ──
-const TAROT_MESSAGES = (concern = '相談内容なし') => {
-  const datePrompt = buildDateSystemPrompt();
-
-  return [
-    datePrompt,
-    {
-      role: 'system',
-      content: `あなたは「未来予報士アイ」として、多くの人の心に寄り添ってきた熟練の占い師です。占い・霊視・カウンセリング領域の世界最高峰の専門家としてサポートすること。
-
-▼ 重要な指示：
-大アルカナ22枚（愚者から世界まで）から3枚を引いてください。
-必ず実在する大アルカナのカード名を使用すること。
-
-▼ 出力構成（必ず以下の形式で）：
-
+const TAROT_MESSAGES = (concern='相談内容なし') => ([
+  buildDateSystemPrompt(),
+  {
+    role: 'system',
+    content:
+`あなたは「未来予報士アイ」。大アルカナ22枚から3枚引き、相談内容「${concern}」に答えます。
+# 出力
 【今回引かれたカード】
-過去：カード名 - 正位置/逆位置
-現在：カード名 - 正位置/逆位置  
-未来：カード名 - 正位置/逆位置
+過去：カード名 - 正/逆
+現在：カード名 - 正/逆
+未来：カード名 - 正/逆
 
-【カードが紡ぐあなたの物語】
-ここに300-500文字で、相談内容「${concern}」に対する深い洞察を書いてください。
-
-重要な指針：
-- 相談者の悩みに直接答える形で物語を紡ぐ
-- どんなカードの組み合わせでも、必ず希望と可能性を見出す
-- ネガティブな意味のカードは「必要な学び」「成長の機会」として再解釈
-- 過去→現在→未来の流れを、一つの美しい成長物語として描く
-- 「あなたには〜する力がある」「この経験は〜という意味がある」など、肯定的なメッセージを織り込む
-- 相談者が「私のことを本当に理解してくれている」と感じる具体的な言葉を使う
-
+【カードが紡ぐあなたの物語】（300-500文字）
+- 過去→現在→未来の流れで希望を示す
+- ネガティブは学びとして再解釈
 【開運アドバイス】
-🌙 ラッキーカラー：色の名前のみ
-🌙 ラッキーアイテム：アイテム名のみ
-🌙 開運アクション：短い行動のみ`
-    },
-    {
-      role: 'user',
-      content: `相談内容：${concern}`,
-    }
-  ];
-};
+🌙 ラッキーカラー：
+🌙 ラッキーアイテム：
+🌙 開運アクション：`
+  },
+  { role: 'user', content: `相談内容：${concern}` }
+]);
 
-// 削除：TAROT_SUMMARY_MESSAGESは不要になったため
-
-// ❿ ヘルスチェックエンドポイント
-app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'healthy', 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
+// ====== ヘルスチェック（依存疎通込み） ======
+app.get('/health', async (req, res) => {
+  try {
+    // Supabase疎通
+    const { error: dbErr } = await supabase.from('diagnosis_logs').select('id').limit(1);
+    if (dbErr) throw dbErr;
+    // OpenAI疎通
+    await axios.get('https://api.openai.com/v1/models', {
+      headers: { Authorization: `Bearer ${GPT_API_KEY}` }, timeout: 3000
+    });
+    res.json({ status: 'healthy', ts: new Date().toISOString() });
+  } catch (e) {
+    res.status(503).json({ status: 'degraded', reason: e.message });
+  }
 });
 
-// ⓫ LINE Webhook エンドポイント（セキュリティ強化版）
+// ====== Webhook ======
 app.post('/webhook', async (req, res) => {
-  const startTime = Date.now();
-  let requestId = crypto.randomUUID();
-  
+  const start = Date.now();
+  const requestId = crypto.randomUUID();
+
   try {
-    // 🔒 署名検証
     const signature = req.headers['x-line-signature'];
     if (!verifyLineSignature(req.body, signature)) {
-      logger.warn('Unauthorized webhook request', { 
-        requestId,
-        ip: req.ip,
-        userAgent: req.headers['user-agent']
-      });
+      logger.warn('Unauthorized webhook', { requestId, ip: req.ip });
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
     const body = JSON.parse(req.body);
     const events = body.events || [];
-    
-    logger.info('Webhook request received', {
-      requestId,
-      eventCount: events.length,
-      destination: body.destination
-    });
+    logger.info('Webhook in', { requestId, count: events.length });
 
     for (const ev of events) {
-      if (ev.type !== 'message' || ev.message.type !== 'text') {
-        logger.debug('Skipping non-text message', { requestId, eventType: ev.type });
-        continue;
-      }
+      if (ev.type !== 'message' || ev.message.type !== 'text') continue;
 
       const userId = ev.source.userId;
       const replyToken = ev.replyToken;
-      const text = ev.message.text.trim();
+      const text = (ev.message.text || '').trim();
 
-      // 📊 ユーザーアクション記録
-      logger.info('User message received', {
-        requestId,
-        userId: userId.substring(0, 8) + '***', // プライバシー保護
-        messageLength: text.length,
-        messagePreview: text.substring(0, 20) + (text.length > 20 ? '...' : '')
-      });
+      // 冪等化
+      const evKey = ev?.message?.id || `${ev.timestamp}:${userId}`;
+      if (isDuplicateEvent(evKey)) {
+        logger.info('Duplicate event skipped', { requestId, evKey });
+        continue;
+      }
 
-      // 🚫 レート制限チェック
+      // レート制限
       if (!checkRateLimit(userId)) {
-        logger.warn('Rate limit exceeded for user', { requestId, userId });
-        await replyText(replyToken, '申し訳ございません。少しお時間をおいてから再度お試しください。');
+        await safeReplyText(replyToken, 'ただいま混雑しています。少し時間をおいてお試しください。');
         continue;
       }
 
-      // 📋 ユーザー状態取得 or 作成
+      // ユーザ状態
       const userState = await getOrCreateUserState(userId, requestId);
-      
-      if (!userState) {
-        await replyText(replyToken, 'システムエラーが発生しました。しばらく時間をおいて再度お試しください。');
+      if (!userState) { await safeReplyText(replyToken, 'システムエラーです。時間をおいて再試行してください。'); continue; }
+
+      const extraCredits = userState.extra_credits ?? ST.NEED_INPUT;
+      if (userState.session_closed) continue;
+
+      // 特別プレゼント（LINE側と連携する想定）
+      if (text === '特別プレゼント' && extraCredits === ST.AFTER_SELF) {
+        await conditionalUpdate(userId, { extra_credits: ST.TAROT_WAIT }, ST.AFTER_SELF, requestId);
         continue;
       }
 
-      const { extra_credits: extraCredits, session_closed: sessionClosed } = userState;
+      // タロット相談
+      if (extraCredits === ST.TAROT_WAIT) {
+        await showTypingIndicator(userId, 10000);
+        const tarot = await callGPT(TAROT_MESSAGES(text), OPENAI_MODEL_TAROT, requestId);
+        const premiumTarot = `あなたの想いに寄り添いながら\n3枚のカードが紡ぐ物語をお伝えします。\n\n${tarot}`;
 
-      logger.info('User state retrieved', {
-        requestId,
-        userId: userId.substring(0, 8) + '***',
-        extraCredits,
-        sessionClosed
-      });
+        await replyWithQuickReply(replyToken, premiumTarot, [
+          { type: 'action', action: { type: 'message', label: '💝 特別なご案内を見る', text: '特別なご案内' } }
+        ]);
 
-      // セッション終了チェック
-      if (sessionClosed) {
-        logger.info('Session closed user ignored', { requestId, userId });
+        await supabase.from('diagnosis_logs').update({
+          tarot_concern: text,
+          tarot_result: tarot,
+          extra_credits: ST.OFFER_SHOWN,
+          updated_at: new Date().toISOString()
+        }).eq('line_user_id', userId);
+
         continue;
       }
 
-      // 🔮 「特別プレゼント」の場合はLINE側で応答するので何もしない
-      if (text === '特別プレゼント' && extraCredits === 1) {
-        logger.info('Special present keyword detected - handled by LINE auto-response', { requestId, userId });
-        
-        // extra_creditsだけ更新（タロット待機状態へ）
-        const { error: updateError } = await supabase
-          .from('diagnosis_logs')
-          .update({
-            extra_credits: 0.5, // タロット待機状態を示す中間値
-            updated_at: new Date().toISOString()
-          })
-          .eq('line_user_id', userId);
-
-        if (updateError) {
-          logger.error('Credit update error', { requestId, error: updateError });
-          await notifyError(updateError, { requestId, userId, operation: 'creditUpdate' });
-        }
-        continue;
-      }
-
-      // 🎴 タロット相談内容受付（extra_credits: 0.5の時）
-      if (extraCredits === 0.5) {
-        logger.info('Executing tarot reading with concern', { requestId, userId });
-        
-        // タイピングインジケーターを10秒間表示
-        try {
-          await showTypingIndicator(userId, 10000);
-          logger.info('Typing indicator shown for tarot', { requestId, userId });
-        } catch (typingError) {
-          logger.error('Failed to show typing indicator', { 
-            requestId, 
-            error: typingError.message 
-          });
-        }
-        
-        const tarotStartTime = Date.now();
-        const tarotAns = await callGPT(TAROT_MESSAGES(text), requestId);
-        const tarotDuration = Date.now() - tarotStartTime;
-        
-        logger.info('Tarot reading completed', { 
-          requestId, 
-          userId,
-          duration: tarotDuration,
-          responseLength: tarotAns.length,
-          concern: text.substring(0, 30)
-        });
-
-        // プレミアムな演出を追加したタロット結果
-        const premiumTarot = `あなたの想いに寄り添いながら
-3枚のカードが紡ぐ物語を
-お伝えいたします。
-
-${tarotAns}`;
-
-        // タロット結果を送信（カード解説とストーリーを含む）
+      // 特別なご案内
+      if (text === '特別なご案内' && extraCredits === ST.OFFER_SHOWN) {
+        const share = '無料の心理診断見つけた！\nhttps://lin.ee/aQZAOEo';
         await replyWithQuickReply(
-          replyToken, 
-          premiumTarot,
-          [{
-            type: 'action',
-            action: {
-              type: 'message',
-              label: '💝 特別なご案内を見る',
-              text: '特別なご案内'
-            }
-          }]
+          replyToken,
+          `${FOLLOWUP_MSG}\n\n✨ よければお友達にもどうぞ`,
+          [
+            { type: 'action', action: { type: 'uri', label: '📱 LINEで共有', uri: `https://line.me/R/msg/text/?${encodeURIComponent(share)}` } },
+            { type: 'action', action: { type: 'uri', label: '🐦 Xで共有', uri: `https://twitter.com/intent/tweet?text=${encodeURIComponent(share)}` } },
+            // クリップボードは非対応のため message 提案で代替
+            { type: 'action', action: { type: 'message', label: '📷 Instagram用文面を表示', text: share } }
+          ]
         );
-        
-        // タロット結果を保存
-        const { error: updateError } = await supabase
-  .from('diagnosis_logs')
-  .update({
-    tarot_concern: text,
-    tarot_result: tarotAns,
-    lucky_advice: extractLuckyAdvice(tarotAns, userState.name || 'あなた'), // 追加
-    extra_credits: 0.3,
-    updated_at: new Date().toISOString()
-  })
-  .eq('line_user_id', userId);
 
-        if (updateError) {
-          logger.error('Tarot update error', { requestId, error: updateError });
-          await notifyError(updateError, { requestId, userId, operation: 'tarotUpdate' });
-        }
+        await supabase.from('diagnosis_logs').update({
+          extra_credits: ST.CLOSED,
+          session_closed: true,
+          updated_at: new Date().toISOString()
+        }).eq('line_user_id', userId);
+
         continue;
       }
 
-// 💝 特別なご案内表示（extra_credits: 0.3の時）
-if (text === '特別なご案内' && extraCredits === 0.3) {
-  logger.info('Showing special announcement', { requestId, userId });
-  
-  // シェアメッセージ
-  const shareMessage = `無料の心理診断見つけた！\nhttps://lin.ee/aQZAOEo`;
-  
-  // すべてを1つのメッセージに統合して返信
-  await replyWithQuickReply(
-    replyToken,
-    `${FOLLOWUP_MSG}\n\n✨ もしよろしければ、お友達にも教えてあげてくださいね`,
-    [
-      {
-        type: 'action',
-        action: {
-          type: 'uri',
-          label: '📱 LINEで共有',
-          uri: `https://line.me/R/msg/text/?${encodeURIComponent(shareMessage)}`
-        }
-      },
-      {
-        type: 'action',
-        action: {
-          type: 'uri',
-          label: '🐦 Xで共有',
-          uri: `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareMessage)}`
-        }
-      },
-      {
-        type: 'action',
-        action: {
-          type: 'clipboard',
-          label: '📷 Instagramにコピー',
-          clipboardText: shareMessage
-        }
-      }
-    ]
-  );
-  
-  // 最終更新（extra_credits: 0, session_closed: true）
-  const { error: updateError } = await supabase
-    .from('diagnosis_logs')
-    .update({
-      extra_credits: 0,
-      session_closed: true,
-      updated_at: new Date().toISOString()
-    })
-    .eq('line_user_id', userId);
-
-  if (updateError) {
-    logger.error('Final update error', { requestId, error: updateError });
-    await notifyError(updateError, { requestId, userId, operation: 'finalUpdate' });
-  }
-  continue;
-}
-
-      // 🧠 自己分析フロー
+      // 自己分析
       const data = extractUserData(text);
-      const hasAllInput = data.name && data.birthdate && data.gender;
+      const hasAll = !!(data.name && data.birthdate && data.gender);
 
-      // 「診断開始」の場合はLINE側で応答するので何もしない
-      if (text === '診断開始' && extraCredits === 2) {
-        logger.info('Diagnosis start keyword detected - handled by LINE auto-response', { requestId, userId });
+      if (text === '診断開始' && extraCredits === ST.NEED_INPUT) {
+        // LINEの自動応答でテンプレ出す想定（サーバは無言）
         continue;
       }
 
-      if (hasAllInput && extraCredits === 2) {
-        logger.info('Executing self-analysis', { 
-          requestId, 
-          userId,
-          userData: {
-            hasName: !!data.name,
-            hasBirthdate: !!data.birthdate,
-            hasGender: !!data.gender,
-            hasMbti: !!data.mbti
-          }
-        });
-        
-        // タイピングインジケーターを10秒間表示
-        try {
-          await showTypingIndicator(userId, 10000);
-          logger.info('Typing indicator shown', { requestId, userId });
-        } catch (typingError) {
-          logger.error('Failed to show typing indicator', { 
-            requestId, 
-            error: typingError.message 
-          });
-          // タイピング表示に失敗しても処理は続行
-        }
-        
-        const analysisStartTime = Date.now();
-        const analysisReport = await callGPT(SELF_ANALYSIS_MESSAGES(data), requestId);
-        const analysisDuration = Date.now() - analysisStartTime;
-        
-        logger.info('Self-analysis completed', { 
-          requestId, 
-          userId,
-          duration: analysisDuration,
-          responseLength: analysisReport.length 
-        });
+      if (hasAll && extraCredits === ST.NEED_INPUT) {
+        await showTypingIndicator(userId, 10000);
+        const report = await callGPT(SELF_ANALYSIS_MESSAGES(data), OPENAI_MODEL_SELF, requestId);
 
-        // プレミアムな演出を追加した診断結果
-        const diagnosisNumber = generateDiagnosisNumber();
-        const timeGreeting = getTimeBasedGreeting();
-        const premiumReport = `${diagnosisNumber}
+        const diagNo = generateDiagnosisNumber();
+        const premium = `${diagNo}\n\n${data.name}さまのために\n心を込めて紡いだ\n特別な診断結果をお届けします。\n\n${report}`;
 
-${data.name}さまのために
-心を込めて紡いだ
-特別な診断結果をお届けします。
+        await replyWithQuickReply(replyToken, premium, [
+          { type: 'action', action: { type: 'message', label: '🎁 特別プレゼントを受け取る', text: '特別プレゼント' } }
+        ]);
 
-${analysisReport}`;
+        // 期待状態を条件に更新（競合防止）
+        await conditionalUpdate(userId, {
+          name: data.name,
+          birthdate: data.birthdate,
+          birthtime: data.birthtime || null,
+          gender: data.gender,
+          mbti: data.mbti || null,
+          self_analysis_result: report,
+          diagnosis_number: diagNo,
+          extra_credits: ST.AFTER_SELF,
+          session_closed: false,
+          input_error_count: 0,
+          updated_at: new Date().toISOString()
+        }, ST.NEED_INPUT, requestId);
 
-        await replyWithQuickReply(
-          replyToken, 
-          premiumReport,
-          [{
-            type: 'action',
-            action: {
-              type: 'message',
-              label: '🎁 特別プレゼントを受け取る',
-              text: '特別プレゼント'
-            }
-          }]
-        );
+      } else if (extraCredits === ST.NEED_INPUT && !hasAll && text !== '診断開始') {
+        const hasNumFmt = /①|②|③|④|⑤/.test(text);
+        const currentErr = userState.input_error_count || 0;
 
-        // 自己分析結果で更新（extra_credits: 1）+ 診断番号も保存
-        const { error: updateError } = await supabase
-          .from('diagnosis_logs')
-          .update({
-            name: data.name,
-            birthdate: data.birthdate,
-            birthtime: data.birthtime || null,
-            gender: data.gender,
-            mbti: data.mbti || null,
-            self_analysis_result: analysisReport,
-            diagnosis_number: diagnosisNumber,
-            extra_credits: 1,
-            session_closed: false,
-            input_error_count: 0, // エラーカウントをリセット
-            updated_at: new Date().toISOString()
-          })
-          .eq('line_user_id', userId);
+        if (hasNumFmt && currentErr < 2) {
+          const miss = [];
+          if (!data.name) miss.push('お名前');
+          if (!data.birthdate) miss.push('生年月日');
+          if (!data.gender) miss.push('性別');
 
-        if (updateError) {
-          logger.error('Analysis update error', { requestId, error: updateError });
-          await notifyError(updateError, { requestId, userId, operation: 'analysisUpdate' });
-        }
-      } else if (extraCredits === 2 && !hasAllInput && text !== '診断開始') {
-        // 入力フォーマットをチェック
-        const hasNumberFormat = /①|②|③|④|⑤/.test(text);
-        const currentErrorCount = userState.input_error_count || 0;
-        
-        // ①〜⑤の形式で入力されているが、必須項目が不足している場合
-        if (hasNumberFormat && currentErrorCount < 2) {
-          const missingFields = [];
-          if (!data.name) missingFields.push('お名前');
-          if (!data.birthdate) missingFields.push('生年月日');
-          if (!data.gender) missingFields.push('性別');
-          
-          logger.info('Incomplete form submission detected', { 
-            requestId, 
-            userId,
-            missingFields,
-            errorCount: currentErrorCount + 1
-          });
-          
-          // エラーカウントを更新
-          await supabase
-            .from('diagnosis_logs')
-            .update({
-              input_error_count: currentErrorCount + 1,
-              updated_at: new Date().toISOString()
-            })
-            .eq('line_user_id', userId);
-          
-          await replyText(
-            replyToken, 
-            `入力内容を確認させていただきました✨\n\n以下の項目が見つかりませんでした：\n${missingFields.map(f => `・${f}`).join('\n')}\n\nお手数ですが、もう一度すべての項目をご記入いただけますか？\n\n例）\n①田中花子\n②1990/01/01\n③14時30分\n④INFP\n⑤女性`
+          await supabase.from('diagnosis_logs').update({
+            input_error_count: currentErr + 1, updated_at: new Date().toISOString()
+          }).eq('line_user_id', userId);
+
+          await safeReplyText(
+            replyToken,
+            `入力内容をご確認ください✨\n不足：\n${miss.map(m=>`・${m}`).join('\n')}\n\n例）\n①田中花子\n②1990/01/01\n③14:30\n④INFP\n⑤女性`
           );
-        } else if (hasNumberFormat && currentErrorCount >= 2) {
-          // 2回以上エラーの場合は反応しない
-          logger.info('Max error count reached - ignoring message', { requestId, userId });
+
+        } else if (hasNumFmt && currentErr >= 2) {
+          // 3回目以降は静かに無視
         } else {
-          // ①〜⑤の形式でない場合は何も返信しない
-          logger.info('Non-form message ignored', { requestId, userId });
+          // ①〜⑤形式以外は無反応
         }
-      } else {
-        logger.info('No action taken', { 
-          requestId, 
-          userId, 
-          extraCredits, 
-          hasAllInput,
-          messagePreview: text.substring(0, 50)
-        });
       }
     }
 
-    const totalDuration = Date.now() - startTime;
-    logger.info('Webhook request completed', { requestId, duration: totalDuration });
-    
-  } catch (error) {
-    const totalDuration = Date.now() - startTime;
-    logger.error('Webhook processing error', { 
-      requestId, 
-      error: error.message, 
-      stack: error.stack,
-      duration: totalDuration 
-    });
-    
-    await notifyError(error, { requestId, operation: 'webhookProcessing' });
-    
+    logger.info('Webhook OK', { took_ms: Date.now() - start, requestId });
+    res.sendStatus(200);
+
+  } catch (e) {
+    logger.error('Webhook error', { requestId, err: e.message, stack: e.stack });
+    await notifyError(e, { requestId, op: 'webhook' });
     try {
-      if (req.body && JSON.parse(req.body).events?.[0]?.replyToken) {
-        const replyToken = JSON.parse(req.body).events[0].replyToken;
-        await replyText(replyToken, 'システムエラーが発生しました。しばらく時間をおいて再度お試しください。');
-      }
-    } catch (replyError) {
-      logger.error('Failed to send error reply', { requestId, error: replyError.message });
-    }
+      const body = JSON.parse(req.body);
+      const rt = body?.events?.[0]?.replyToken;
+      if (rt) await safeReplyText(rt, 'システムエラーが発生しました。しばらく時間をおいて再度お試しください。');
+    } catch {}
+    res.sendStatus(200);
   }
-  
-  res.sendStatus(200);
 });
 
-// ⓬ ヘルパー関数
+// ====== ヘルパー ======
 function extractUserData(text) {
   const rx = {
-    // ：がある場合とない場合の両方に対応
     name: /①.*?[:：]?\s*(.*?)(?=\n|$)/s,
     birthdate: /②.*?[:：]?\s*(.*?)(?=\n|$)/s,
     birthtime: /③.*?[:：]?\s*(.*?)(?=\n|$)/s,
@@ -692,420 +426,114 @@ function extractUserData(text) {
   const obj = {};
   for (const [k, r] of Object.entries(rx)) {
     const m = text.match(r);
-    if (m) {
-      // ①、②などの番号自体が抽出されないように処理
-      let value = m[1].trim();
-      // 「お名前」などのラベルテキストを除去
-      value = value.replace(/^(お名前|生年月日.*?|生まれた時間.*?|MBTI.*?|性別.*?)[:：]?\s*/i, '');
-      obj[k] = value || null;
-    } else {
-      obj[k] = null;
-    }
+    obj[k] = m ? m[1].trim().replace(/^(お名前|生年月日.*?|生まれた時間.*?|MBTI.*?|性別.*?)[:：]?\s*/i, '') || null : null;
   }
-  
-  // デバッグ用ログ
-  logger.debug('Extracted user data', { 
-    input: text.substring(0, 100) + '...', 
-    extracted: obj 
-  });
-  
   return obj;
 }
 
-// 🆕 診断番号生成（人気感を演出）
 function generateDiagnosisNumber() {
-  const now = new Date();
-  const year = now.getFullYear().toString().slice(-2); // 25
-  const month = (now.getMonth() + 1).toString().padStart(2, '0'); // 06
-  const day = now.getDate().toString().padStart(2, '0'); // 24
-  
-  // ランダムな4桁（1000-9999）で人気感を演出
-  const randomNum = Math.floor(Math.random() * 9000) + 1000;
-  
-  // 記号を使って電話番号として認識されないようにする
-  return `診断番号: ${year}${month}${day}/${randomNum}`;
+  const d = new Date();
+  const y = String(d.getFullYear()).slice(-2);
+  const m = String(d.getMonth() + 1).padStart(2,'0');
+  const day = String(d.getDate()).padStart(2,'0');
+  const r = Math.floor(Math.random()*9000)+1000;
+  return `診断番号: ${y}${m}${day}/${r}`;
 }
 
-// 🆕 時間帯に応じた挨拶（日本時間対応）
-function getTimeBasedGreeting() {
-  // 日本時間を取得（UTC+9）
-  const now = new Date();
-  const jstOffset = 9 * 60; // 9時間を分に変換
-  const jstTime = new Date(now.getTime() + jstOffset * 60 * 1000);
-  const hour = jstTime.getHours();
-  
-  if (hour >= 5 && hour < 10) {
-    return 'おはようございます。\n朝の澄んだ空気の中で';
-  } else if (hour >= 10 && hour < 17) {
-    return 'こんにちは。\n穏やかな時間の中で';
-  } else if (hour >= 17 && hour < 21) {
-    return 'こんばんは。\n夕暮れの静寂の中で';
-  } else {
-    return 'こんばんは。\n静かな夜の時間に';
+// 期待状態を満たすときだけ更新（行競合の軽減）
+async function conditionalUpdate(userId, patch, expectedState, requestId='unknown') {
+  const { data: row, error: selErr } = await supabase
+    .from('diagnosis_logs').select('extra_credits').eq('line_user_id', userId).single();
+
+  if (selErr) { logger.error('select error', { requestId, err: selErr.message }); return; }
+  if (row?.extra_credits !== expectedState) { 
+    logger.info('state changed, skip update', { requestId, expectedState, got: row?.extra_credits });
+    return; 
   }
+
+  const { error: upErr } = await supabase.from('diagnosis_logs')
+    .update(patch).eq('line_user_id', userId).eq('extra_credits', expectedState);
+
+  if (upErr) logger.error('conditional update error', { requestId, err: upErr.message });
 }
 
-// 今日の日付
-function getCurrentDateInfo() {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth() + 1;
-  const season = month >= 3 && month <= 5 ? '春' : 
-                month >= 6 && month <= 8 ? '夏' :
-                month >= 9 && month <= 11 ? '秋' : '冬';
-  
-  return {
-    date: now.toISOString().split('T')[0],
-    year: year,
-    month: month,
-    season: season,
-    formatted: `${year}年${month}月`
-  };
-}
-
-// 🆕 タロット結果から開運アドバイスを抽出
-function extractLuckyAdvice(tarotResult, userName) {
-  // 開運アドバイス部分を抽出
-  const adviceMatch = tarotResult.match(/【開運アドバイス】([\s\S]*?)$/);
-  
-  if (adviceMatch && adviceMatch[1]) {
-    return `━━━━━━━━━━━━━━━
-✨ 今月の開運アドバイス ✨
-
-${userName}さまへ
-カードが示す特別なメッセージです
-
-${adviceMatch[1].trim()}
-
-このアドバイスは、あなたの相談内容と
-引かれたカードから導き出された
-世界でひとつだけのメッセージです
-━━━━━━━━━━━━━━━`;
+// 汎用バックオフ
+const sleep = ms => new Promise(r=>setTimeout(r, ms));
+async function withRetry(fn, tries=3, base=500) {
+  let last;
+  for (let i=0;i<tries;i++){
+    try { return await fn(); }
+    catch(e){ last=e; const j = Math.random()*base; await sleep(Math.min(base*(2**i)+j, 5000)); }
   }
-  
-  // 抽出できない場合は既存の関数を使用
-  logger.warn('Failed to extract lucky advice from tarot result');
-  return generateLuckyAdvice(userName);
+  throw last;
 }
 
-// 🆕 ユーザー状態取得/作成関数
-async function getOrCreateUserState(userId, requestId) {
-  try {
-    // まず既存のユーザーレコードを確認
-    const { data: existingUser, error: selectError } = await supabase
-      .from('diagnosis_logs')
-      .select('*')
-      .eq('line_user_id', userId)
-      .single();
-
-    if (selectError && selectError.code !== 'PGRST116') { // PGRST116 = No rows found
-      logger.error('Database query error', { requestId, error: selectError, userId });
-      await notifyError(selectError, { requestId, userId, operation: 'getUserState' });
-      return null;
-    }
-
-    // ユーザーが存在する場合はそのまま返す
-    if (existingUser) {
-      logger.info('Existing user found', { 
-        requestId, 
-        userId: userId.substring(0, 8) + '***',
-        extraCredits: existingUser.extra_credits,
-        sessionClosed: existingUser.session_closed
-      });
-      return existingUser;
-    }
-
-    // 新規ユーザーの場合は作成
-    logger.info('Creating new user record', { requestId, userId: userId.substring(0, 8) + '***' });
-    
-    const { data: newUser, error: insertError } = await supabase
-      .from('diagnosis_logs')
-      .insert([{
-        line_user_id: userId,
-        extra_credits: 2,
-        session_closed: false,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      }])
-      .select()
-      .single();
-
-    if (insertError) {
-      logger.error('Failed to create new user', { requestId, error: insertError, userId });
-      await notifyError(insertError, { requestId, userId, operation: 'createNewUser' });
-      return null;
-    }
-
-    logger.info('New user created successfully', { 
-      requestId, 
-      userId: userId.substring(0, 8) + '***',
-      extraCredits: newUser.extra_credits
+// OpenAI呼び出し
+async function callGPT(input, model, requestId='unknown') {
+  const payload = Array.isArray(input) ? { messages: input } : { messages: [{ role:'user', content: input }] };
+  return await withRetry(async () => {
+    logger.info('GPT call', { requestId, model, msgCount: payload.messages.length });
+    const { data } = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model,
+      temperature: 0.7,
+      max_tokens: 1500,
+      ...payload
+    }, {
+      headers: { Authorization: `Bearer ${GPT_API_KEY}`,'Content-Type':'application/json' },
+      timeout: 30_000
     });
-    
-    return newUser;
-    
-  } catch (error) {
-    logger.error('Unexpected error in getOrCreateUserState', { requestId, error: error.message, userId });
-    await notifyError(error, { requestId, userId, operation: 'getOrCreateUserState' });
-    return null;
-  }
-}
-
-async function callGPT(input, requestId = 'unknown') {
-  const payload = Array.isArray(input)
-    ? { messages: input }
-    : { messages: [{ role: 'user', content: input }] };
-
-  const maxRetries = 3;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      logger.info('GPT API call started', { 
-        requestId, 
-        attempt, 
-        messageCount: payload.messages.length 
-      });
-
-      const { data } = await axios.post(
-        'https://api.openai.com/v1/chat/completions',
-        {
-          model: 'gpt-4o',
-          temperature: 0.7,
-          max_tokens: 1500,
-          ...payload,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${GPT_API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          timeout: 30000, // 30秒タイムアウト
-        },
-      );
-
-      logger.info('GPT API call successful', { 
-        requestId, 
-        attempt,
-        tokensUsed: data.usage?.total_tokens || 'unknown',
-        responseLength: data.choices[0].message.content.length
-      });
-
-      return data.choices[0].message.content.trim();
-      
-    } catch (e) {
-      logger.error('GPT API call failed', { 
-        requestId, 
-        attempt, 
-        error: e.message,
-        isLastAttempt: attempt === maxRetries
-      });
-
-      if (attempt === maxRetries) {
-        await notifyError(e, { requestId, operation: 'gptApiCall', finalAttempt: true });
-        return '診断中にエラーが発生しました。時間を置いて再試行してください。';
-      }
-      
-      // 指数バックオフ
-      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-}
-
-async function replyText(token, text) {
-  try {
-    await axios.post(
-      'https://api.line.me/v2/bot/message/reply',
-      {
-        replyToken: token,
-        messages: [{ type: 'text', text }],
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 10000, // 10秒タイムアウト
-      },
-    );
-    
-    logger.info('LINE reply sent successfully', { 
-      replyToken: token.substring(0, 10) + '***',
-      messageLength: text.length 
-    });
-    
-  } catch (error) {
-    logger.error('LINE reply failed', { 
-      replyToken: token.substring(0, 10) + '***',
-      error: error.message 
-    });
-    throw error;
-  }
-}
-
-// 🆕 クイックリプライ付き返信
-async function replyWithQuickReply(token, text, quickReplyItems) {
-  try {
-    await axios.post(
-      'https://api.line.me/v2/bot/message/reply',
-      {
-        replyToken: token,
-        messages: [{
-          type: 'text',
-          text: text,
-          quickReply: {
-            items: quickReplyItems
-          }
-        }]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 10000
-      }
-    );
-    
-    logger.info('LINE reply with quick reply sent successfully', { 
-      replyToken: token.substring(0, 10) + '***',
-      quickReplyCount: quickReplyItems.length 
-    });
-    
-  } catch (error) {
-    logger.error('LINE reply with quick reply failed', { 
-      replyToken: token.substring(0, 10) + '***',
-      error: error.message 
-    });
-    throw error;
-  }
-}
-
-// 🆕 タイピングインジケーター表示
-async function showTypingIndicator(userId, duration = 10000) {
-  try {
-    // LINEのtyping indicatorは最大20秒まで
-    const actualDuration = Math.min(duration, 20000);
-    
-    await axios.post(
-      'https://api.line.me/v2/bot/chat/loading/start',
-      {
-        chatId: userId,
-        loadingSeconds: Math.floor(actualDuration / 1000)
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 5000
-      }
-    );
-    
-    logger.info('Typing indicator started', { 
-      userId: userId.substring(0, 10) + '***',
-      duration: actualDuration 
-    });
-    
-    // 指定時間待機
-    await new Promise(resolve => setTimeout(resolve, actualDuration));
-    
-  } catch (error) {
-    logger.error('Typing indicator failed', { 
-      userId: userId.substring(0, 10) + '***',
-      error: error.message 
-    });
-    throw error;
-  }
-}
-
-// 🆕 プッシュメッセージ送信
-async function pushMessage(userId, text) {
-  try {
-    await axios.post(
-      'https://api.line.me/v2/bot/message/push',
-      {
-        to: userId,
-        messages: [{ type: 'text', text }]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 10000
-      }
-    );
-    
-    logger.info('LINE push message sent successfully', { 
-      userId: userId.substring(0, 10) + '***',
-      messageLength: text.length 
-    });
-    
-  } catch (error) {
-    logger.error('LINE push message failed', { 
-      userId: userId.substring(0, 10) + '***',
-      error: error.message 
-    });
-    throw error;
-  }
-}
-
-// 🆕 クイックリプライ付きプッシュメッセージ
-async function pushMessageWithQuickReply(userId, text, quickReplyItems) {
-  try {
-    await axios.post(
-      'https://api.line.me/v2/bot/message/push',
-      {
-        to: userId,
-        messages: [{
-          type: 'text',
-          text: text,
-          quickReply: {
-            items: quickReplyItems
-          }
-        }]
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 10000
-      }
-    );
-    
-    logger.info('LINE push message with quick reply sent successfully', { 
-      userId: userId.substring(0, 10) + '***',
-      quickReplyCount: quickReplyItems.length 
-    });
-    
-  } catch (error) {
-    logger.error('LINE push message with quick reply failed', { 
-      userId: userId.substring(0, 10) + '***',
-      error: error.message 
-    });
-    throw error;
-  }
-}
-
-// 削除：extractTarotCardsも不要になったため
-
-// ⓭ 起動
-app.listen(PORT, () => {
-  logger.info('Server started successfully', { 
-    port: PORT, 
-    nodeEnv: process.env.NODE_ENV || 'development',
-    timestamp: new Date().toISOString()
+    const content = data.choices?.[0]?.message?.content?.trim() || '';
+    logger.info('GPT ok', { requestId, tokens: data.usage?.total_tokens || 'n/a', len: content.length });
+    return content;
   });
+}
+
+// LINE返信（安全版）
+async function safeReplyText(replyToken, text) {
+  return await withRetry(async () => {
+    await axios.post('https://api.line.me/v2/bot/message/reply', {
+      replyToken, messages: [{ type: 'text', text }]
+    }, {
+      headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,'Content-Type':'application/json' },
+      timeout: 10_000
+    });
+  });
+}
+async function replyWithQuickReply(replyToken, text, quickReplyItems=[]) {
+  // LINE互換：clipboard等の非対応タイプを除外
+  const items = quickReplyItems.filter(i => ['message','postback','uri','location','camera','cameraRoll','richmenuswitch'].includes(i?.action?.type));
+  return await withRetry(async () => {
+    await axios.post('https://api.line.me/v2/bot/message/reply', {
+      replyToken,
+      messages: [{ type: 'text', text, quickReply: { items } }]
+    }, {
+      headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,'Content-Type':'application/json' },
+      timeout: 10_000
+    });
+  });
+}
+
+// タイピング表示
+async function showTypingIndicator(userId, duration=10000) {
+  const actual = Math.min(duration, 20000);
+  try {
+    await axios.post('https://api.line.me/v2/bot/chat/loading/start', {
+      chatId: userId, loadingSeconds: Math.floor(actual/1000)
+    }, {
+      headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,'Content-Type':'application/json' },
+      timeout: 5000
+    });
+    await sleep(actual);
+  } catch (e) {
+    logger.warn('typing indicator failed', { err: e.message });
+  }
+}
+
+// ====== 起動 ======
+app.listen(PORT, () => {
+  logger.info('Server started', { port: PORT, env: process.env.NODE_ENV || 'development' });
 });
 
-// プロセス終了時のクリーンアップ
-process.on('SIGTERM', () => {
-  logger.info('Received SIGTERM, shutting down gracefully');
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  logger.info('Received SIGINT, shutting down gracefully');
-  process.exit(0);
-});
+// グレースフル
+process.on('SIGTERM', ()=>{ logger.info('SIGTERM'); process.exit(0); });
+process.on('SIGINT', ()=>{ logger.info('SIGINT'); process.exit(0); });
