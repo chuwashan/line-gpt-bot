@@ -1,14 +1,14 @@
 /*
  * server.js — LINE × Supabase × GPT（堅牢版 / 2025-08）
  * 変更点（要約）
- * - ✅ モデル名をENV化（OPENAI_MODEL / *_SELF / *_TAROT）
- * - ✅ JSTの時刻取得をIntlで安全に
- * - ✅ イベント冪等化（重複再送の二重処理防止）
- * - ✅ Supabaseの条件付き更新（期待状態を満たす時だけ更新）
- * - ✅ QuickReplyの互換（clipboard排除） & 送信リトライ
- * - ✅ OpenAI/LINEとも指数バックオフ＋jitter
- * - ✅ 依存疎通込みの /health
- * - ✅ ステートを列挙型で明示（マジックナンバー撤廃）
+ * - モデル名をENV化（OPENAI_MODEL / *_SELF / *_TAROT）
+ * - Buffer raw body対応（署名検証とJSONパースの両立）
+ * - JSTをIntlで安全取得
+ * - イベント冪等化（重複再送の二重処理防止）
+ * - Supabaseの条件付き更新（期待状態を満たす時だけ更新）
+ * - QuickReplyの互換（clipboard排除） & 送信リトライ（指数バックオフ＋jitter）
+ * - OpenAI/LINE/Supabaseの疎通確認つき /health
+ * - ステートを列挙型で明示（マジックナンバー撤廃）
  */
 
 const express = require('express');
@@ -67,7 +67,7 @@ app.use((req, res, next) => {
 app.use('/webhook', bodyParser.raw({ type: 'application/json' }));
 app.use(bodyParser.json());
 
-// ====== レート制限（簡易 / 単一インスタンス） ======
+// ====== レート制限（簡易 / 単一インスタンス想定） ======
 const rateLimit = new Map();
 const RATE_LIMIT_WINDOW = 60_000;
 const RATE_LIMIT_MAX = 10;
@@ -81,23 +81,25 @@ function checkRateLimit(userId) {
 }
 
 // ====== イベント冪等化（重複処理防止） ======
-const processedEvents = new Map(); // 本番はRedis推奨
+const processedEvents = new Map(); // ※将来Redis化推奨
 const EVI_TTL_MS = 10 * 60 * 1000;
 function isDuplicateEvent(key) {
   const now = Date.now();
-  for (const [k, ts] of processedEvents) if (now - ts > EVI_TTL_MS) processedEvents.delete(k);
+  for (const [k, ts] of processedEvents) {
+    if (now - ts > EVI_TTL_MS) processedEvents.delete(k);
+  }
   if (processedEvents.has(key)) return true;
   processedEvents.set(key, now);
   return false;
 }
 
-// ====== ステート定数 ======
+// ====== ステート（列挙） ======
 const ST = {
-  NEED_INPUT: 2,
-  AFTER_SELF: 1,
-  TAROT_WAIT: 0.5,
-  OFFER_SHOWN: 0.3,
-  CLOSED: 0
+  NEED_INPUT: 2,     // ①〜⑤の入力待ち
+  AFTER_SELF: 1,     // 自己分析済み → 特別プレゼント待ち
+  TAROT_WAIT: 0.5,   // タロット相談内容入力待ち
+  OFFER_SHOWN: 0.3,  // 特別なご案内表示後 → 終了前
+  CLOSED: 0          // セッション終了
 };
 
 // ====== 署名検証 ======
@@ -114,10 +116,13 @@ async function notifyError(error, context = {}) {
   try {
     await axios.post(SLACK_WEBHOOK_URL, {
       text: '🚨 LINE Bot Error',
-      attachments: [{ color: 'danger', fields: [
-        { title: 'Error', value: error.message, short: false },
-        { title: 'Context', value: '```' + JSON.stringify(context).slice(0, 2000) + '```', short: false }
-      ]}]
+      attachments: [{
+        color: 'danger',
+        fields: [
+          { title: 'Error', value: error.message, short: false },
+          { title: 'Context', value: '```' + JSON.stringify(context).slice(0, 1800) + '```', short: false }
+        ]
+      }]
     });
   } catch (e) {
     logger.error('Slack notify failed', { err: e.message });
@@ -169,7 +174,7 @@ function getCurrentDateInfo() {
   const now = new Date();
   const y = now.getFullYear();
   const m = now.getMonth() + 1;
-  const season = m>=3&&m<=5?'春':m>=6&&m<=8?'夏':m>=9&&m<=11?'秋':'冬';
+  const season = m >= 3 && m <= 5 ? '春' : m >= 6 && m <= 8 ? '夏' : m >= 9 && m <= 11 ? '秋' : '冬';
   return { formatted: `${y}年${m}月`, season };
 }
 function buildDateSystemPrompt() {
@@ -257,7 +262,7 @@ app.post('/webhook', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    const body = JSON.parse(req.body);
+    const body = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString('utf8') : req.body);
     const events = body.events || [];
     logger.info('Webhook in', { requestId, count: events.length });
 
@@ -288,9 +293,9 @@ app.post('/webhook', async (req, res) => {
       const extraCredits = userState.extra_credits ?? ST.NEED_INPUT;
       if (userState.session_closed) continue;
 
-      // 特別プレゼント（LINE側と連携する想定）
+      // 特別プレゼント（自己分析後のキーワード）
       if (text === '特別プレゼント' && extraCredits === ST.AFTER_SELF) {
-        await conditionalUpdate(userId, { extra_credits: ST.TAROT_WAIT }, ST.AFTER_SELF, requestId);
+        await conditionalUpdate(userId, { extra_credits: ST.TAROT_WAIT, updated_at: new Date().toISOString() }, ST.AFTER_SELF, requestId);
         continue;
       }
 
@@ -323,7 +328,7 @@ app.post('/webhook', async (req, res) => {
           [
             { type: 'action', action: { type: 'uri', label: '📱 LINEで共有', uri: `https://line.me/R/msg/text/?${encodeURIComponent(share)}` } },
             { type: 'action', action: { type: 'uri', label: '🐦 Xで共有', uri: `https://twitter.com/intent/tweet?text=${encodeURIComponent(share)}` } },
-            // クリップボードは非対応のため message 提案で代替
+            // クリップボードは非対応のため message で代替
             { type: 'action', action: { type: 'message', label: '📷 Instagram用文面を表示', text: share } }
           ]
         );
@@ -342,7 +347,7 @@ app.post('/webhook', async (req, res) => {
       const hasAll = !!(data.name && data.birthdate && data.gender);
 
       if (text === '診断開始' && extraCredits === ST.NEED_INPUT) {
-        // LINEの自動応答でテンプレ出す想定（サーバは無言）
+        // LINE側の自動応答テンプレに任せる（ここでは無言）
         continue;
       }
 
@@ -383,7 +388,8 @@ app.post('/webhook', async (req, res) => {
           if (!data.gender) miss.push('性別');
 
           await supabase.from('diagnosis_logs').update({
-            input_error_count: currentErr + 1, updated_at: new Date().toISOString()
+            input_error_count: currentErr + 1,
+            updated_at: new Date().toISOString()
           }).eq('line_user_id', userId);
 
           await safeReplyText(
@@ -406,15 +412,15 @@ app.post('/webhook', async (req, res) => {
     logger.error('Webhook error', { requestId, err: e.message, stack: e.stack });
     await notifyError(e, { requestId, op: 'webhook' });
     try {
-      const body = JSON.parse(req.body);
-      const rt = body?.events?.[0]?.replyToken;
+      const parsed = JSON.parse(Buffer.isBuffer(req.body) ? req.body.toString('utf8') : req.body);
+      const rt = parsed?.events?.[0]?.replyToken;
       if (rt) await safeReplyText(rt, 'システムエラーが発生しました。しばらく時間をおいて再度お試しください。');
     } catch {}
     res.sendStatus(200);
   }
 });
 
-// ====== ヘルパー ======
+// ====== ヘルパー関数群 ======
 function extractUserData(text) {
   const rx = {
     name: /①.*?[:：]?\s*(.*?)(?=\n|$)/s,
@@ -446,9 +452,9 @@ async function conditionalUpdate(userId, patch, expectedState, requestId='unknow
     .from('diagnosis_logs').select('extra_credits').eq('line_user_id', userId).single();
 
   if (selErr) { logger.error('select error', { requestId, err: selErr.message }); return; }
-  if (row?.extra_credits !== expectedState) { 
+  if (row?.extra_credits !== expectedState) {
     logger.info('state changed, skip update', { requestId, expectedState, got: row?.extra_credits });
-    return; 
+    return;
   }
 
   const { error: upErr } = await supabase.from('diagnosis_logs')
@@ -526,6 +532,58 @@ async function showTypingIndicator(userId, duration=10000) {
     await sleep(actual);
   } catch (e) {
     logger.warn('typing indicator failed', { err: e.message });
+  }
+}
+
+// === ユーザー状態の取得/作成 ===
+async function getOrCreateUserState(userId, requestId = 'unknown') {
+  try {
+    // 既存レコードの取得
+    const { data: existing, error: selErr } = await supabase
+      .from('diagnosis_logs')
+      .select('*')
+      .eq('line_user_id', userId)
+      .single();
+
+    // 行が無い場合（PGRST116）
+    if (selErr?.code === 'PGRST116') {
+      logger.info('No user record: creating new', { requestId, userId: userId.slice(0,8)+'***' });
+
+      const { data: inserted, error: insErr } = await supabase
+        .from('diagnosis_logs')
+        .insert([{
+          line_user_id: userId,
+          extra_credits: ST.NEED_INPUT,   // 2：入力待ち
+          session_closed: false,
+          input_error_count: 0,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }])
+        .select()
+        .single();
+
+      if (insErr) {
+        logger.error('create user failed', { requestId, err: insErr.message });
+        await notifyError(insErr, { requestId, op: 'createNewUser', userId });
+        return null;
+      }
+      return inserted;
+    }
+
+    // 取得時の別エラーはアラート
+    if (selErr) {
+      logger.error('select user failed', { requestId, err: selErr.message });
+      await notifyError(selErr, { requestId, op: 'getUserState', userId });
+      return null;
+    }
+
+    // 既存ユーザーを返す
+    return existing;
+
+  } catch (e) {
+    logger.error('getOrCreateUserState exception', { requestId, err: e.message });
+    await notifyError(e, { requestId, op: 'getOrCreateUserState', userId });
+    return null;
   }
 }
 
